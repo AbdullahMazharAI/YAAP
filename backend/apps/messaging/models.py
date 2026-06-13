@@ -93,24 +93,14 @@ class Message(models.Model):
         MessageDeletion.objects.get_or_create(message=self, user=user)
 
 
-#class MessageDeletion(models.Model):
-   # message    = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="deletions")
-    #user       = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    #deleted_at = models.DateTimeField(auto_now_add=True)
-
-    #class Meta:
-     #   db_table        = "message_deletions"
-      #  unique_together = [("message", "user")]
-
-
-
 class MessageDeletion(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  
-    message = models.ForeignKey("messaging.Message", on_delete=models.CASCADE)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    message    = models.ForeignKey("messaging.Message", on_delete=models.CASCADE)
+    user       = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     deleted_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
+        indexes = [models.Index(fields=["user"], name="msg_deletion_user_idx")]
         constraints = [
             models.UniqueConstraint(fields=["message", "user"], name="unique_message_deletion")
         ]

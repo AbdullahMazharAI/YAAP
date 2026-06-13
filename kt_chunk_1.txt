@@ -1,0 +1,800 @@
+        tokenManager.saveTokens(accessToken, refreshToken)
+
+    fun clearTokens() = tokenManager.clearTokens()
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\repository\Repositories.kt =====
+package com.yaap.app.data.repository
+
+import com.yaap.app.data.api.YaapApiService
+import com.yaap.app.data.local.dao.ConversationDao
+import com.yaap.app.data.local.dao.MessageDao
+import com.yaap.app.data.local.entity.ConversationEntity
+import com.yaap.app.data.local.entity.MessageEntity
+import com.yaap.app.model.*
+import com.yaap.app.utils.Result
+import kotlinx.coroutines.flow.Flow
+import okhttp3.MultipartBody
+import javax.inject.Inject
+import javax.inject.Singleton
+
+// ────────────────────────────────────────────────────────────────────
+//  ChatRepository
+// ────────────────────────────────────────────────────────────────────
+@Singleton
+class ChatRepository @Inject constructor(
+    private val api: YaapApiService,
+    private val conversationDao: ConversationDao,
+    private val messageDao: MessageDao
+) {
+    fun observeConversations(): Flow<List<ConversationEntity>> = conversationDao.observeAll()
+
+    suspend fun refreshConversations(): Result<List<Conversation>> {
+        // Unwrap envelope → get ConversationsDataResponse → extract conversations list
+        val result = safeApiCall { api.getConversations() }
+        return when (result) {
+            is Result.Success -> {
+                val conversations = result.data.conversations
+                val entities = conversations.map { c ->
+                    ConversationEntity(
+                        id = c.id,
+                        otherUserId = c.otherUser.id,
+                        otherUserName = c.otherUser.displayName,
+                        otherUserAvatar = c.otherUser.avatarUrl,
+                        otherUserCountryCode = c.otherUser.countryCode,
+                        otherUserTimezone = c.otherUser.timezone,
+                        otherUserOnline = c.otherUser.isOnline,
+                        lastMessageContent = c.lastMessage?.content,
+                        lastMessageTranslation = c.lastMessage?.translation,
+                        lastMessageTimestamp = c.lastMessage?.createdAt,
+                        unreadCount = c.unreadCount,
+                        updatedAt = c.updatedAt
+                    )
+                }
+                conversationDao.upsertAll(entities)
+                Result.Success(conversations)
+            }
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun startConversation(userId: String): Result<StartConversationResponse> {
+        val result = safeApiCall {
+            api.startConversation(StartConversationRequest(userId))
+        }
+        return when (result) {
+            is Result.Success -> {
+                val conv = result.data.conversation
+                Result.Success(StartConversationResponse(id = conv.id))
+            }
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun getMessages(conversationId: String, cursor: String? = null): Result<MessagesPage> {
+        val result = safeApiCall { api.getMessages(conversationId, cursor) }
+        if (result is Result.Success) {
+            val page = result.data
+            val entities = page.messages.map { m ->
+                MessageEntity(
+                    id = m.id,
+                    conversationId = m.conversationId,
+                    senderId = m.senderId,
+                    content = m.content,
+                    translation = m.translation,
+                    status = m.status,
+                    createdAt = m.createdAt,
+                    deleted = m.deleted
+                )
+            }
+            messageDao.upsertAll(entities)
+        }
+        return result
+    }
+
+    fun observeMessages(conversationId: String): Flow<List<MessageEntity>> =
+        messageDao.observeMessages(conversationId)
+
+    suspend fun insertMessage(entity: MessageEntity) {
+        messageDao.insert(entity)
+    }
+
+    suspend fun insertMessages(entities: List<MessageEntity>) {
+        messageDao.upsertAll(entities)
+    }
+
+    suspend fun updateMessageTranslation(messageId: String, translation: String) {
+        messageDao.updateTranslation(messageId, translation)
+    }
+
+    suspend fun markMessageDeleted(messageId: String) {
+        messageDao.markDeleted(messageId)
+    }
+
+    suspend fun updateMessageStatus(messageId: String, status: String) {
+        messageDao.updateStatus(messageId, status)
+    }
+
+    suspend fun translateMessage(messageId: String, language: String): Result<TranslateMessageDataResponse> =
+        safeApiCall { api.translateMessage(messageId, TranslateMessageRequest(language)) }
+
+    suspend fun deleteMessage(messageId: String): Result<MessageResponse> = safeApiCall {
+        api.deleteMessage(messageId)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  FriendRepository
+// ────────────────────────────────────────────────────────────────────
+@Singleton
+class FriendRepository @Inject constructor(private val api: YaapApiService) {
+
+    suspend fun registerDevice(fcmToken: String, deviceName: String): Result<MessageResponse> = safeApiCall {
+        api.registerDevice(RegisterDeviceRequest(fcmToken, deviceName))
+    }
+
+    suspend fun getFriends(): Result<List<Friendship>> {
+        val result = safeApiCall { api.getFriends() }
+        return when (result) {
+            is Result.Success -> Result.Success(result.data.friends)
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun unfriend(friendshipId: String): Result<MessageResponse> = safeApiCall {
+        api.unfriend(friendshipId)
+    }
+
+    suspend fun sendFriendRequest(toUserId: String): Result<FriendRequest> {
+        val result = safeApiCall {
+            api.sendFriendRequest(SendFriendRequest(toUserId))
+        }
+        return when (result) {
+            is Result.Success -> Result.Success(result.data.request)
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun getReceivedRequests(): Result<List<FriendRequest>> {
+        val result = safeApiCall { api.getReceivedRequests() }
+        return when (result) {
+            is Result.Success -> Result.Success(result.data.requests)
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun getSentRequests(): Result<List<FriendRequest>> {
+        val result = safeApiCall { api.getSentRequests() }
+        return when (result) {
+            is Result.Success -> Result.Success(result.data.requests)
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun acceptRequest(requestId: String): Result<AcceptRequestDataResponse> = safeApiCall {
+        api.acceptFriendRequest(requestId)
+    }
+
+    suspend fun declineRequest(requestId: String): Result<MessageResponse> = safeApiCall {
+        api.declineFriendRequest(requestId)
+    }
+
+    suspend fun cancelRequest(requestId: String): Result<MessageResponse> = safeApiCall {
+        api.cancelFriendRequest(requestId)
+    }
+
+    suspend fun blockUser(userId: String): Result<MessageResponse> = safeApiCall {
+        api.blockUser(BlockRequest(userId))
+    }
+
+    suspend fun unblockUser(userId: String): Result<MessageResponse> = safeApiCall {
+        api.unblockUser(userId)
+    }
+
+    suspend fun getBlockedUsers(): Result<Map<String, Any>> = safeApiCall { api.getBlockedUsers() }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  VoiceRepository
+// ────────────────────────────────────────────────────────────────────
+@Singleton
+class VoiceRepository @Inject constructor(private val api: YaapApiService) {
+
+    suspend fun getSentences(): Result<VoiceSentencesDataResponse> = safeApiCall {
+        api.getVoiceSentences()
+    }
+
+    suspend fun uploadSample(
+        audioPart: MultipartBody.Part,
+        sampleIndex: Int,
+        sentenceId: String
+    ): Result<VoiceSampleDataResponse> = safeApiCall {
+        api.uploadVoiceSample(audioPart, sampleIndex, sentenceId)
+    }
+
+    suspend fun deleteSample(index: Int): Result<MessageResponse> = safeApiCall {
+        api.deleteVoiceSample(index)
+    }
+
+    suspend fun trainVoice(): Result<VoiceTrainDataResponse> = safeApiCall { api.trainVoice() }
+
+    suspend fun getVoiceStatus(): Result<VoiceStatusDataResponse> = safeApiCall { api.getVoiceStatus() }
+
+    suspend fun resetVoice(): Result<MessageResponse> = safeApiCall { api.resetVoice() }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  CallRepository
+// ────────────────────────────────────────────────────────────────────
+@Singleton
+class CallRepository @Inject constructor(private val api: YaapApiService) {
+
+    suspend fun initiateCall(calleeId: String, language: String? = null): Result<InitiateCallDataResponse> =
+        safeApiCall { api.initiateCall(InitiateCallRequest(calleeId, language)) }
+
+    suspend fun getIceConfig(roomId: String): Result<IceConfigDataResponse> = safeApiCall {
+        api.getIceConfig(roomId)
+    }
+
+    suspend fun endCall(roomId: String): Result<MessageResponse> = safeApiCall { api.endCall(roomId) }
+
+    suspend fun declineCall(roomId: String): Result<MessageResponse> = safeApiCall {
+        api.declineCall(roomId)
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\repository\RepositoryHelper.kt =====
+package com.yaap.app.data.repository
+
+import com.google.gson.Gson
+import com.yaap.app.model.ApiEnvelope
+import com.yaap.app.model.ApiError
+import com.yaap.app.utils.Result
+import retrofit2.Response
+
+/**
+ * Wraps a Retrofit suspend call that returns ApiEnvelope<T>,
+ * automatically unwrapping the envelope and returning Result<T>.
+ */
+suspend fun <T> safeApiCall(call: suspend () -> Response<ApiEnvelope<T>>): Result<T> {
+    return try {
+        val response = call()
+        if (response.isSuccessful) {
+            val envelope = response.body()
+            if (envelope != null && envelope.success && envelope.data != null) {
+                Result.Success(envelope.data)
+            } else if (envelope != null && !envelope.success) {
+                val msg = envelope.error?.message ?: "Request failed"
+                Result.Error(msg, response.code())
+            } else {
+                Result.Error("Empty response data", response.code())
+            }
+        } else {
+            val errorBody = response.errorBody()?.string()
+            val message = try {
+                // Try to parse as envelope error first
+                val envelope = Gson().fromJson(errorBody, ApiEnvelope::class.java)
+                envelope?.error?.message ?: errorBody ?: "Unknown error"
+            } catch (e: Exception) {
+                try {
+                    Gson().fromJson(errorBody, ApiError::class.java)?.message
+                        ?: errorBody ?: "Error ${response.code()}"
+                } catch (e2: Exception) {
+                    errorBody ?: "Error ${response.code()}"
+                }
+            }
+            Result.Error(message, response.code())
+        }
+    } catch (e: java.net.SocketTimeoutException) {
+        Result.Error("Request timed out. Check your connection.")
+    } catch (e: java.net.ConnectException) {
+        Result.Error("Unable to connect. Check your network.")
+    } catch (e: java.net.UnknownHostException) {
+        Result.Error("No internet connection.")
+    } catch (e: Exception) {
+        Result.Error(e.message ?: "Unexpected error")
+    }
+}
+
+/**
+ * Wraps a Retrofit suspend call that returns a raw (non-envelope) response.
+ * Used for endpoints that don't wrap in {"success": true, "data": ...}
+ * (e.g. user profile endpoints that return the object directly).
+ */
+suspend fun <T> safeCall(call: suspend () -> Response<T>): Result<T> {
+    return try {
+        val response = call()
+        if (response.isSuccessful) {
+            val body = response.body()
+            if (body != null) Result.Success(body)
+            else Result.Error("Empty response", response.code())
+        } else {
+            val errorBody = response.errorBody()?.string()
+            val message = try {
+                Gson().fromJson(errorBody, ApiError::class.java)?.message
+                    ?: errorBody ?: "Unknown error"
+            } catch (e: Exception) {
+                errorBody ?: "Error ${response.code()}"
+            }
+            Result.Error(message, response.code())
+        }
+    } catch (e: java.net.SocketTimeoutException) {
+        Result.Error("Request timed out. Check your connection.")
+    } catch (e: java.net.ConnectException) {
+        Result.Error("Unable to connect. Check your network.")
+    } catch (e: java.net.UnknownHostException) {
+        Result.Error("No internet connection.")
+    } catch (e: Exception) {
+        Result.Error(e.message ?: "Unexpected error")
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\repository\UserRepository.kt =====
+package com.yaap.app.data.repository
+
+import com.yaap.app.data.api.YaapApiService
+import com.yaap.app.model.*
+import com.yaap.app.utils.Result
+import okhttp3.MultipartBody
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class UserRepository @Inject constructor(private val api: YaapApiService) {
+
+    suspend fun getMyProfile(): Result<User> = safeApiCall { api.getMyProfile() }
+
+    suspend fun updateProfile(request: UpdateProfileRequest): Result<User> = safeApiCall {
+        api.updateProfile(request)
+    }
+
+    suspend fun uploadAvatar(avatarPart: MultipartBody.Part): Result<Map<String, String>> = safeApiCall {
+        api.uploadAvatar(avatarPart)
+    }
+
+    suspend fun updateLanguage(language: String): Result<Map<String, String>> = safeApiCall {
+        api.updateLanguage(LanguageUpdateRequest(language))
+    }
+
+    suspend fun getLanguages(): Result<List<Language>> {
+        val result = safeApiCall { api.getLanguages() }
+        return when (result) {
+            is Result.Success -> Result.Success(result.data.languages)
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun searchUsers(query: String): Result<List<UserSearchResult>> {
+        val result = safeApiCall { api.searchUsers(query) }
+        return when (result) {
+            is Result.Success -> Result.Success(result.data.results)
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun getUserProfile(userId: String): Result<User> = safeApiCall {
+        api.getUserProfile(userId)
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\di\AppModule.kt =====
+package com.yaap.app.di
+
+import android.content.Context
+import com.yaap.app.BuildConfig
+import com.yaap.app.data.api.AuthInterceptor
+import com.yaap.app.data.api.TokenAuthenticator
+import com.yaap.app.data.api.YaapApiService
+import com.yaap.app.data.local.YaapDatabase
+import com.yaap.app.data.local.dao.*
+import dagger.Lazy
+import dagger.Module
+import dagger.Provides
+import dagger.hilt.InstallIn
+import dagger.hilt.android.qualifiers.ApplicationContext
+import dagger.hilt.components.SingletonComponent
+import okhttp3.OkHttpClient
+import okhttp3.logging.HttpLoggingInterceptor
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import java.util.concurrent.TimeUnit
+import javax.inject.Singleton
+
+@Module
+@InstallIn(SingletonComponent::class)
+object NetworkModule {
+
+    @Provides
+    @Singleton
+    fun provideLoggingInterceptor(): HttpLoggingInterceptor =
+        HttpLoggingInterceptor().apply {
+            level = if (BuildConfig.DEBUG)
+                HttpLoggingInterceptor.Level.BODY
+            else
+                HttpLoggingInterceptor.Level.NONE
+        }
+
+    @Provides
+    @Singleton
+    fun provideOkHttpClient(
+        authInterceptor: AuthInterceptor,
+        tokenAuthenticator: Lazy<TokenAuthenticator>,   // ← Lazy breaks the cycle
+        loggingInterceptor: HttpLoggingInterceptor
+    ): OkHttpClient = OkHttpClient.Builder()
+        .addInterceptor(authInterceptor)
+        .authenticator { route, response -> tokenAuthenticator.get().authenticate(route, response) }
+        .addInterceptor(loggingInterceptor)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+
+    @Provides
+    @Singleton
+    fun provideRetrofit(okHttpClient: OkHttpClient): Retrofit =
+        Retrofit.Builder()
+            .baseUrl(BuildConfig.BASE_URL)
+            .client(okHttpClient)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+
+    @Provides
+    @Singleton
+    fun provideApiService(retrofit: Retrofit): YaapApiService =
+        retrofit.create(YaapApiService::class.java)
+}
+
+@Module
+@InstallIn(SingletonComponent::class)
+object DatabaseModule {
+
+    @Provides
+    @Singleton
+    fun provideDatabase(@ApplicationContext context: Context): YaapDatabase =
+        YaapDatabase.create(context)
+
+    @Provides fun provideConversationDao(db: YaapDatabase): ConversationDao = db.conversationDao()
+    @Provides fun provideMessageDao(db: YaapDatabase): MessageDao = db.messageDao()
+    @Provides fun provideUserDao(db: YaapDatabase): UserDao = db.userDao()
+    @Provides fun provideFriendRequestDao(db: YaapDatabase): FriendRequestDao = db.friendRequestDao()
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\model\Models.kt =====
+package com.yaap.app.model
+
+import com.google.gson.annotations.SerializedName
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Generic API Envelope — wraps every backend response
+//  Backend shape: {"success": true/false, "data": {...}} or
+//                 {"success": false, "error": {"code": "...", "message": "..."}}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class ApiEnvelope<T>(
+    val success: Boolean,
+    val data: T?,
+    val error: ApiErrorDetail? = null
+)
+
+data class ApiErrorDetail(
+    val code: String?,
+    val message: String?
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Auth — Request Models
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class LoginRequest(val email: String, val password: String)
+
+data class SignupRequest(
+    val email: String,
+    val password: String,
+    @SerializedName("full_name") val fullName: String,
+    @SerializedName("password_confirm") val passwordConfirm: String
+)
+
+data class OtpRequestBody(val email: String)
+data class OtpVerifyRequest(val email: String, val otp: String)
+data class GoogleAuthRequest(@SerializedName("id_token") val idToken: String)
+data class RefreshTokenRequest(val refresh: String)  // Backend expects "refresh", not "refresh_token"
+data class PasswordStrengthRequest(val password: String)
+data class PasswordStrengthResponse(val score: Int, val label: String)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Auth — Response Models (match backend's nested structure)
+//
+//  Backend login/signup returns:
+//  {"success": true, "data": {
+//      "user": {...},
+//      "tokens": {"access": "...", "refresh": "..."},
+//      "next_step": "personal_details"
+//  }}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class TokenPair(
+    val access: String,
+    val refresh: String
+)
+
+data class AuthDataResponse(
+    val user: User?,
+    val tokens: TokenPair,
+    @SerializedName("next_step") val nextStep: String,
+    @SerializedName("is_new") val isNew: Boolean = false,
+    @SerializedName("password_strength") val passwordStrength: Map<String, Any>? = null
+)
+
+/** Convenience — old code referenced this flat shape. Now it's built from AuthDataResponse. */
+data class AuthResponse(
+    val accessToken: String,
+    val refreshToken: String,
+    val nextStep: String,
+    val isNew: Boolean = false
+) {
+    companion object {
+        fun from(data: AuthDataResponse): AuthResponse = AuthResponse(
+            accessToken = data.tokens.access,
+            refreshToken = data.tokens.refresh,
+            nextStep = data.nextStep,
+            isNew = data.isNew
+        )
+    }
+}
+
+/**
+ *  Token refresh response shape:
+ *  {"success": true, "data": {"tokens": {"access": "...", "refresh": "..."}}}
+ */
+data class TokenRefreshDataResponse(
+    val tokens: TokenPair
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  User / Profile
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class User(
+    val id: String,
+    val email: String,
+    @SerializedName("display_name") val displayName: String,
+    @SerializedName("avatar_url") val avatarUrl: String?,
+    @SerializedName("country_code") val countryCode: String?,
+    val timezone: String?,
+    val bio: String?,
+    @SerializedName("is_online") val isOnline: Boolean = false,
+    @SerializedName("language_preference") val languagePreference: String?,
+    @SerializedName("voice_trained") val voiceTrained: Boolean = false,
+    @SerializedName("date_of_birth") val dateOfBirth: String?,
+    @SerializedName("next_step") val nextStep: String?,
+    @SerializedName("full_name") val fullName: String? = null,
+    @SerializedName("profile_complete") val profileComplete: Boolean = false,
+    @SerializedName("language_selected") val languageSelected: Boolean = false
+)
+
+data class UpdateProfileRequest(
+    @SerializedName("display_name") val displayName: String? = null,
+    val bio: String? = null,
+    @SerializedName("country_code") val countryCode: String? = null,
+    @SerializedName("date_of_birth") val dateOfBirth: String? = null,
+    val timezone: String? = null
+)
+
+data class LanguageUpdateRequest(@SerializedName("language_preference") val language: String)
+
+data class Language(
+    val code: String,
+    val name: String,
+    @SerializedName("native_name") val nativeName: String? = null,
+    @SerializedName("flag_emoji") val flagEmoji: String? = null
+)
+
+// Backend response wrappers for user endpoints
+data class LanguagesDataResponse(
+    val languages: List<Language>
+)
+
+data class UserSearchDataResponse(
+    val results: List<UserSearchResult>,
+    val count: Int
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Voice Training
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class VoiceSentence(
+    val id: String,
+    val text: String,
+    val index: Int
+)
+
+data class VoiceSampleResponse(
+    val id: String,
+    @SerializedName("noise_warning") val noiseWarning: Boolean = false
+)
+
+data class VoiceTrainResponse(val status: String)
+data class VoiceStatusResponse(
+    val status: String,
+    @SerializedName("voice_trained") val voiceTrained: Boolean
+)
+
+// Backend response wrappers for voice endpoints
+data class VoiceSentencesDataResponse(
+    val language: String,
+    @SerializedName("language_name") val languageName: String,
+    val sentences: List<VoiceSentence>,
+    @SerializedName("total_required") val totalRequired: Int
+)
+
+data class VoiceSampleDataResponse(
+    val sample: Map<String, Any>,
+    @SerializedName("samples_uploaded") val samplesUploaded: Int,
+    @SerializedName("samples_required") val samplesRequired: Int,
+    @SerializedName("all_uploaded") val allUploaded: Boolean,
+    @SerializedName("noise_warning") val noiseWarning: Boolean,
+    @SerializedName("noise_floor_db") val noiseFloorDb: Double
+)
+
+data class VoiceStatusDataResponse(
+    @SerializedName("voice_trained") val voiceTrained: Boolean,
+    @SerializedName("samples_uploaded") val samplesUploaded: Int,
+    @SerializedName("samples_required") val samplesRequired: Int,
+    @SerializedName("all_samples_uploaded") val allSamplesUploaded: Boolean,
+    @SerializedName("active_job") val activeJob: Map<String, Any>?,
+    val samples: List<Map<String, Any>>
+)
+
+data class VoiceTrainDataResponse(
+    val job: Map<String, Any>,
+    val message: String
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Friendship
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class FriendRequest(
+    val id: String,
+    @SerializedName("from_user") val fromUser: User,
+    @SerializedName("to_user") val toUser: User,
+    val status: String,
+    @SerializedName("created_at") val createdAt: String,
+    val message: String?
+)
+
+data class SendFriendRequest(
+    @SerializedName("to_user_id") val toUserId: String,
+    val message: String? = null
+)
+
+data class Friendship(
+    val id: String,
+    val friend: User,
+    @SerializedName("created_at") val createdAt: String
+)
+
+data class BlockRequest(@SerializedName("user_id") val userId: String)
+
+data class UserSearchResult(
+    val id: String,
+    @SerializedName("display_name") val displayName: String,
+    @SerializedName("avatar_url") val avatarUrl: String?,
+    @SerializedName("country_code") val countryCode: String?,
+    val timezone: String?,
+    @SerializedName("mutual_friends") val mutualFriends: Int = 0,
+    @SerializedName("friendship_status") val friendshipStatus: String
+)
+
+// Backend response wrappers for friendship endpoints
+data class FriendsDataResponse(
+    val friends: List<Friendship>,
+    val count: Int
+)
+
+data class FriendRequestsDataResponse(
+    val requests: List<FriendRequest>,
+    val count: Int
+)
+
+data class FriendRequestSendDataResponse(
+    val request: FriendRequest
+)
+
+data class AcceptRequestDataResponse(
+    val message: String,
+    @SerializedName("friendship_id") val friendshipId: String
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Conversations & Messages
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class Conversation(
+    val id: String,
+    @SerializedName("other_user") val otherUser: User,
+    @SerializedName("last_message") val lastMessage: Message?,
+    @SerializedName("unread_count") val unreadCount: Int = 0,
+    @SerializedName("updated_at") val updatedAt: String
+)
+
+data class Message(
+    val id: String,
+    @SerializedName("conversation_id") val conversationId: String,
+    @SerializedName("sender_id") val senderId: String,
+    val content: String,
+    val translation: String?,
+    val status: String,
+    @SerializedName("created_at") val createdAt: String,
+    val deleted: Boolean = false
+)
+
+data class StartConversationRequest(@SerializedName("user_id") val userId: String)
+data class StartConversationResponse(val id: String)
+
+data class TranslateMessageRequest(val language: String)
+data class TranslateMessageResponse(val translation: String, val language: String)
+
+data class MessagesPage(
+    val messages: List<Message>,
+    @SerializedName("next_cursor") val nextCursor: String?,
+    @SerializedName("has_more") val hasMore: Boolean
+)
+
+// Backend response wrappers for messaging endpoints
+data class ConversationsDataResponse(
+    val conversations: List<Conversation>
+)
+
+data class ConversationDataResponse(
+    val conversation: Conversation
+)
+
+data class TranslateMessageDataResponse(
+    @SerializedName("message_id") val messageId: String,
+    val language: String,
+    @SerializedName("translated_content") val translatedContent: String,
+    val cached: Boolean
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Calls
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class InitiateCallRequest(
+    @SerializedName("callee_id") val calleeId: String,
+    val language: String? = null
+)
+
+data class InitiateCallResponse(
+    @SerializedName("room_id") val roomId: String,
+    @SerializedName("caller_id") val callerId: String,
+    @SerializedName("callee_id") val calleeId: String
+)
+
+data class IceConfigResponse(
+    @SerializedName("ice_servers") val iceServers: List<IceServer>
+)
+
+data class IceServer(
+    val urls: List<String>,
+    val username: String?,
+    val credential: String?
+)
+
+// Backend response wrappers for call endpoints
+data class InitiateCallDataResponse(
+    val room: Map<String, Any>,
+    val ice: Map<String, Any>,

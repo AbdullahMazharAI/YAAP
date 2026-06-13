@@ -17,6 +17,7 @@ import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.yaap.app.data.api.ChatWebSocket
 import com.yaap.app.data.local.entity.MessageEntity
+import com.yaap.app.data.local.entity.ConversationEntity
 import com.yaap.app.data.repository.ChatRepository
 import com.yaap.app.databinding.ActivityChatBinding
 import com.yaap.app.databinding.ItemMessageReceivedBinding
@@ -46,6 +47,8 @@ class ChatActivityViewModel(
 
     val messages: Flow<List<MessageEntity>> = repo.observeMessages(conversationId)
 
+    suspend fun getConversation(): ConversationEntity? = repo.getConversation(conversationId)
+
     private val _wsEvents = MutableSharedFlow<JSONObject>(replay = 0, extraBufferCapacity = 64)
     val wsEvents: SharedFlow<JSONObject> = _wsEvents
 
@@ -54,6 +57,7 @@ class ChatActivityViewModel(
     var nextCursor: String? = null
 
     fun connectWebSocket() {
+        if (chatWs != null) return   // guard: already connected (e.g. after config change)
         val token = tokenManager.getAccessToken() ?: return
         chatWs = ChatWebSocket(okHttpClient, conversationId, token).also {
             it.connect()
@@ -92,7 +96,7 @@ class ChatActivityViewModel(
     }
 
     fun disconnectWebSocket() {
-        chatWs?.disconnect()
+        chatWs?.disconnect()   // also cancels the socket's internal CoroutineScope
         chatWs = null
     }
 
@@ -231,16 +235,28 @@ class ChatActivity : AppCompatActivity() {
     private fun setupToolbar() {
         binding.btnBack.setOnClickListener { finish() }
         binding.btnCall.setOnClickListener {
-            startActivity(Intent(this, com.yaap.app.ui.call.CallActivity::class.java))
+            lifecycleScope.launch {
+                val conv = viewModel.getConversation()
+                if (conv != null) {
+                    startActivity(Intent(this@ChatActivity, com.yaap.app.ui.call.CallActivity::class.java)
+                        .putExtra(Constants.EXTRA_FRIEND_ID, conv.otherUserId))
+                } else {
+                    startActivity(Intent(this@ChatActivity, com.yaap.app.ui.call.CallActivity::class.java))
+                }
+            }
         }
     }
 
     private fun observeState() {
-        // Observe Room DB — reactive list that auto-updates when messages are inserted/updated
+        // Observe Room DB — query is now ASC so no reversal needed
         lifecycleScope.launch {
             viewModel.messages.collect { messages ->
-                adapter.submitList(messages.reversed())
-                if (messages.isNotEmpty()) binding.rvMessages.scrollToPosition(messages.size - 1)
+                adapter.submitList(messages) {
+                    // scroll runs AFTER ListAdapter finishes async diff — no race condition
+                    if (messages.isNotEmpty()) {
+                        binding.rvMessages.scrollToPosition(messages.size - 1)
+                    }
+                }
             }
         }
 
@@ -350,17 +366,23 @@ class ChatActivity : AppCompatActivity() {
      */
     private fun parseMessagePayload(msg: JSONObject): MessageEntity? {
         return try {
-            val senderId = msg.optJSONObject("sender")?.optString("id")
-                ?: msg.optString("sender_id")
+            // optString() returns "" (not null) when key is absent.
+            // Use takeIf { isNotBlank() } so the ?: chain falls through correctly.
+            val senderId = msg.optJSONObject("sender")
+                ?.optString("id")?.takeIf { it.isNotBlank() }
+                ?: msg.optString("sender_id").takeIf { it.isNotBlank() }
+                ?: ""
+            Log.d(TAG, "parseMessagePayload: id=${msg.optString("id")} senderId=$senderId")
+            val translation = msg.optString("translation").takeIf { it.isNotBlank() && it != "null" }
             MessageEntity(
-                id = msg.getString("id"),
+                id             = msg.getString("id"),
                 conversationId = msg.getString("conversation_id"),
-                senderId = senderId,
-                content = msg.optString("content", ""),
-                translation = null,
-                status = msg.optString("status", "sent"),
-                createdAt = msg.getString("created_at"),
-                deleted = msg.optBoolean("deleted_for_everyone", false)
+                senderId       = senderId,
+                content        = msg.optString("content", ""),
+                translation    = translation,
+                status         = msg.optString("status", "sent"),
+                createdAt      = msg.getString("created_at"),
+                deleted        = msg.optBoolean("deleted_for_everyone", false)
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to parse message payload: ${e.message}")

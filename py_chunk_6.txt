@@ -1,0 +1,800 @@
+    path("start/",                                    ConversationDetailView.as_view(),  name="conversation-start"),
+    path("<uuid:conversation_id>/messages/",          MessageListView.as_view(),         name="message-list"),
+    path("messages/<uuid:message_id>/translate/",     TranslateMessageView.as_view(),    name="message-translate"),
+    path("messages/<uuid:message_id>/",               DeleteMessageView.as_view(),        name="message-delete"),
+]
+# ===== d:/yaap1/YAAP\backend\apps\messaging\views.py =====
+"""Messaging REST Views"""
+import logging
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import Conversation, Message, MessageTranslation
+from .serializers import ConversationSerializer, MessageSerializer, TranslateMessageSerializer
+
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
+def _ok(data, sc=status.HTTP_200_OK): return Response({"success": True, "data": data}, status=sc)
+def _err(code, msg, sc=status.HTTP_400_BAD_REQUEST): return Response({"success": False, "error": {"code": code, "message": msg}}, status=sc)
+
+
+class ConversationListView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request):
+        convs = Conversation.objects.for_user(request.user)
+        return _ok({"conversations": ConversationSerializer(convs, many=True, context={"request": request}).data})
+
+class ConversationDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request):
+        uid = request.data.get("user_id")
+        if not uid: return _err("MISSING_USER", "user_id required.")
+        try:
+            other = User.objects.get(id=uid, is_active=True)
+        except User.DoesNotExist:
+            return _err("NOT_FOUND", "User not found.", status.HTTP_404_NOT_FOUND)
+        if str(other.id) == str(request.user.id): return _err("SELF", "Cannot message yourself.")
+        from apps.friendships.models import Friendship
+        if not Friendship.objects.are_friends(request.user, other):
+            return _err("NOT_FRIENDS", "Must be friends first.", status.HTTP_403_FORBIDDEN)
+        conv, created = Conversation.objects.get_or_create_between(request.user, other)
+        return _ok({"conversation": ConversationSerializer(conv, context={"request": request}).data},
+                   status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+class MessageListView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request, conversation_id):
+        try:
+            conv = Conversation.objects.get(Q(id=conversation_id) & (Q(participant_a=request.user) | Q(participant_b=request.user)))
+        except Conversation.DoesNotExist:
+            return _err("NOT_FOUND", "Conversation not found.", status.HTTP_404_NOT_FOUND)
+        cursor    = request.query_params.get("cursor")
+        page_size = min(int(request.query_params.get("page_size", 50)), 100)
+        qs = Message.objects.visible_to(request.user, conv)
+        if cursor:
+            from django.utils.dateparse import parse_datetime
+            try: qs = qs.filter(created_at__lt=parse_datetime(cursor))
+            except Exception: pass
+        batch     = list(qs[:page_size + 1])
+        has_more  = len(batch) > page_size
+        batch     = batch[:page_size]
+        next_cur  = batch[-1].created_at.isoformat() if has_more and batch else None
+        return _ok({"messages": MessageSerializer(batch, many=True, context={"request": request, "preferred_language": request.user.language_preference}).data,
+                    "next_cursor": next_cur, "has_more": has_more})
+
+class TranslateMessageView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request, message_id):
+        s = TranslateMessageSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        lang = s.validated_data["language"]
+        try:
+            msg = Message.objects.select_related("conversation").get(id=message_id, deleted_for_everyone=False)
+        except Message.DoesNotExist:
+            return _err("NOT_FOUND", "Message not found.", status.HTTP_404_NOT_FOUND)
+        conv = msg.conversation
+        if request.user.id not in (conv.participant_a_id, conv.participant_b_id):
+            return _err("FORBIDDEN", "Not a participant.", status.HTTP_403_FORBIDDEN)
+        existing = MessageTranslation.objects.filter(message=msg, language=lang).first()
+        if existing:
+            return _ok({"message_id": str(msg.id), "language": lang, "translated_content": existing.translated_content, "cached": True})
+        from services.translation import translate
+        translated  = translate(msg.content, lang, msg.original_language)
+        translation = MessageTranslation.objects.create(message=msg, language=lang, translated_content=translated)
+        return _ok({"message_id": str(msg.id), "language": lang, "translated_content": translation.translated_content, "cached": False})
+
+class DeleteMessageView(APIView):
+    permission_classes = [IsAuthenticated]
+    def delete(self, request, message_id):
+        scope = request.data.get("scope", "me")
+        if scope not in ("everyone", "me"): return _err("INVALID_SCOPE", "scope: 'everyone' or 'me'.")
+        try:
+            msg = Message.objects.select_related("conversation").get(id=message_id)
+        except Message.DoesNotExist:
+            return _err("NOT_FOUND", "Message not found.", status.HTTP_404_NOT_FOUND)
+        conv = msg.conversation
+        if request.user.id not in (conv.participant_a_id, conv.participant_b_id):
+            return _err("FORBIDDEN", "Not a participant.", status.HTTP_403_FORBIDDEN)
+        if scope == "everyone":
+            if msg.sender_id != request.user.id: return _err("NOT_SENDER", "Only sender can delete for everyone.")
+            if not msg.can_delete_for_everyone(request.user): return _err("WINDOW_EXPIRED", "Delete window has passed.")
+            msg.delete_for_everyone()
+        else:
+            msg.delete_for_user(request.user)
+        return _ok({"message": f"Deleted for {scope}."})
+# ===== d:/yaap1/YAAP\backend\apps\messaging\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\messaging\tests\test_messaging.py =====
+"""
+Messaging tests — Phase 3
+Covers: conversation create, message send, history, translate, delete.
+"""
+import pytest
+from unittest.mock import patch
+from apps.messaging.models import Conversation, Message, MessageTranslation
+from apps.friendships.models import FriendRequest
+
+
+# ─── Conversation ─────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestConversation:
+
+    def test_start_conversation_between_friends(self, auth_client, user_b, friends):
+        client, user = auth_client
+        resp = client.post("/api/v1/conversations/start/", {"user_id": str(user_b.id)})
+        assert resp.status_code in (200, 201)
+        assert "conversation" in resp.json()["data"]
+
+    def test_cannot_start_with_non_friend(self, auth_client, user_b):
+        client, _ = auth_client
+        resp = client.post("/api/v1/conversations/start/", {"user_id": str(user_b.id)})
+        assert resp.status_code == 403
+
+    def test_idempotent_start(self, auth_client, user_b, friends):
+        client, _ = auth_client
+        resp1 = client.post("/api/v1/conversations/start/", {"user_id": str(user_b.id)})
+        resp2 = client.post("/api/v1/conversations/start/", {"user_id": str(user_b.id)})
+        id1 = resp1.json()["data"]["conversation"]["id"]
+        id2 = resp2.json()["data"]["conversation"]["id"]
+        assert id1 == id2
+
+    def test_conversation_list_shows_own(self, auth_client, conversation):
+        client, _ = auth_client
+        resp = client.get("/api/v1/conversations/")
+        assert resp.status_code == 200
+        ids = [c["id"] for c in resp.json()["data"]["conversations"]]
+        assert str(conversation.id) in ids
+
+    def test_requires_auth(self, api_client):
+        assert api_client.get("/api/v1/conversations/").status_code == 401
+
+
+# ─── Messages ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestMessages:
+
+    @patch("apps.messaging.views.translate_message_task.apply_async")
+    def test_send_message(self, mock_task, auth_client, conversation):
+        client, user = auth_client
+        resp = client.post(
+            f"/api/v1/conversations/{conversation.id}/messages/",
+            {"content": "Hello from test!"},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["data"]["message"]["content"] == "Hello from test!"
+        assert Message.objects.filter(conversation=conversation).count() == 1
+
+    def test_send_empty_message_rejected(self, auth_client, conversation):
+        client, _ = auth_client
+        resp = client.post(f"/api/v1/conversations/{conversation.id}/messages/", {"content": ""})
+        assert resp.status_code == 400
+
+    def test_send_too_long_rejected(self, auth_client, conversation):
+        client, _ = auth_client
+        resp = client.post(
+            f"/api/v1/conversations/{conversation.id}/messages/",
+            {"content": "x" * 4001},
+        )
+        assert resp.status_code == 400
+
+    @patch("apps.messaging.views.translate_message_task.apply_async")
+    def test_message_history_pagination(self, mock_task, auth_client, conversation):
+        client, user = auth_client
+        for i in range(5):
+            Message.objects.create(
+                conversation=conversation, sender=user,
+                content=f"Message {i}", original_language="en",
+            )
+        resp = client.get(
+            f"/api/v1/conversations/{conversation.id}/messages/",
+            {"page_size": 3},
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert len(data["messages"]) == 3
+        assert data["has_more"] is True
+
+    def test_non_participant_cannot_read(self, auth_client_c, conversation):
+        client, _ = auth_client_c
+        resp = client.get(f"/api/v1/conversations/{conversation.id}/messages/")
+        assert resp.status_code == 404
+
+
+# ─── Delete Message ───────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestDeleteMessage:
+
+    def _msg(self, conv, sender):
+        return Message.objects.create(
+            conversation=conv, sender=sender, content="delete me", original_language="en"
+        )
+
+    def test_delete_for_me(self, auth_client, conversation, user):
+        client, user = auth_client
+        msg = self._msg(conversation, user)
+        resp = client.delete(
+            f"/api/v1/conversations/messages/{msg.id}/",
+            {"scope": "me"}, format="json",
+        )
+        assert resp.status_code == 200
+        from apps.messaging.models import MessageDeletion
+        assert MessageDeletion.objects.filter(message=msg, user=user).exists()
+
+    def test_delete_for_everyone_by_sender(self, auth_client, conversation, user):
+        client, user = auth_client
+        msg = self._msg(conversation, user)
+        resp = client.delete(
+            f"/api/v1/conversations/messages/{msg.id}/",
+            {"scope": "everyone"}, format="json",
+        )
+        assert resp.status_code == 200
+        msg.refresh_from_db()
+        assert msg.deleted_for_everyone is True
+
+    def test_non_sender_cannot_delete_for_everyone(self, auth_client_b, conversation, user):
+        client, user_b = auth_client_b
+        msg = self._msg(conversation, user)
+        resp = client.delete(
+            f"/api/v1/conversations/messages/{msg.id}/",
+            {"scope": "everyone"}, format="json",
+        )
+        assert resp.status_code == 403
+
+
+# ─── Translate Message ────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestTranslateMessage:
+
+    @patch("apps.messaging.views.translate")
+    def test_translate_success(self, mock_translate, auth_client, conversation, user):
+        mock_translate.return_value = "مرحبا"
+        client, _ = auth_client
+        msg = Message.objects.create(
+            conversation=conversation, sender=user, content="Hello", original_language="en"
+        )
+        resp = client.post(
+            f"/api/v1/conversations/messages/{msg.id}/translate/",
+            {"language": "ar"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["translated_content"] == "مرحبا"
+        assert data["language"] == "ar"
+        assert data["cached"] is False
+
+    @patch("apps.messaging.views.translate")
+    def test_translate_returns_cached(self, mock_translate, auth_client, conversation, user):
+        client, _ = auth_client
+        msg = Message.objects.create(
+            conversation=conversation, sender=user, content="Hello", original_language="en"
+        )
+        MessageTranslation.objects.create(message=msg, language="ar", translated_content="مرحبا مخبأ")
+        resp = client.post(
+            f"/api/v1/conversations/messages/{msg.id}/translate/",
+            {"language": "ar"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["cached"] is True
+        assert resp.json()["data"]["translated_content"] == "مرحبا مخبأ"
+        mock_translate.assert_not_called()
+
+    def test_translate_unsupported_language_rejected(self, auth_client, conversation, user):
+        client, _ = auth_client
+        msg = Message.objects.create(
+            conversation=conversation, sender=user, content="Hello", original_language="en"
+        )
+        resp = client.post(
+            f"/api/v1/conversations/messages/{msg.id}/translate/",
+            {"language": "xx"},
+        )
+        assert resp.status_code == 400
+# ===== d:/yaap1/YAAP\backend\apps\messaging\tests\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\voice\admin.py =====
+from django.contrib import admin
+from .models import VoiceSentence, VoiceSample, VoiceTrainingJob
+
+@admin.register(VoiceSentence)
+class VoiceSentenceAdmin(admin.ModelAdmin):
+    list_display  = ["language", "position", "sentence"]
+    list_filter   = ["language"]
+    ordering      = ["language", "position"]
+
+@admin.register(VoiceSample)
+class VoiceSampleAdmin(admin.ModelAdmin):
+    list_display  = ["user", "sample_index", "duration_seconds", "noise_floor_db", "uploaded_at"]
+    list_filter   = ["sample_index"]
+    search_fields = ["user__email"]
+
+@admin.register(VoiceTrainingJob)
+class VoiceTrainingJobAdmin(admin.ModelAdmin):
+    list_display   = ["user", "status", "samples_count", "created_at", "completed_at"]
+    list_filter    = ["status"]
+    search_fields  = ["user__email", "celery_task_id"]
+    readonly_fields = ["id", "celery_task_id", "created_at", "started_at", "completed_at"]
+# ===== d:/yaap1/YAAP\backend\apps\voice\apps.py =====
+from django.apps import AppConfig
+
+class VoiceConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "apps.voice"
+    verbose_name = "Voice"
+# ===== d:/yaap1/YAAP\backend\apps\voice\models.py =====
+"""
+Voice App Models
+VoiceSentence  — bank of 5 sentences per language shown during training
+VoiceSample    — individual recorded audio upload (5 per user)
+VoiceTrainingJob — Celery job record tracking XTTS embedding computation
+"""
+
+import uuid
+from django.conf import settings
+from django.db import models
+from django.utils import timezone
+
+
+class VoiceSentenceManager(models.Manager):
+    def for_language(self, language_code: str):
+        """Return all 5 sentences for a language, ordered by position."""
+        return (
+            self.filter(language=language_code)
+            .order_by("position")
+        )
+
+
+class VoiceSentence(models.Model):
+    """
+    Bank of training sentences.
+    Seeded via supabase_schema.sql and the management command load_voice_sentences.
+    5 sentences per each of the 17 supported languages = 85 rows total.
+    """
+    id       = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    language = models.CharField(max_length=5, db_index=True)
+    sentence = models.TextField()
+    position = models.PositiveSmallIntegerField(
+        help_text="Display order 1–5 on the training screen"
+    )
+    objects  = VoiceSentenceManager()
+
+    class Meta:
+        db_table        = "voice_sentences"
+        unique_together = [("language", "position")]
+        ordering        = ["language", "position"]
+
+    def __str__(self):
+        return f"[{self.language}:{self.position}] {self.sentence[:60]}"
+
+
+class VoiceSample(models.Model):
+    """
+    One recorded audio clip uploaded by a user during voice training.
+    Each user must upload exactly 5 samples (one per sentence).
+    Audio is stored in Supabase Storage (private bucket).
+    """
+    id               = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user             = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="voice_samples",
+    )
+    sentence         = models.ForeignKey(
+        VoiceSentence, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="samples",
+    )
+    sample_index     = models.PositiveSmallIntegerField(
+        help_text="Which of the 5 samples this is (1–5)"
+    )
+    storage_path     = models.TextField(
+        help_text="Supabase Storage path: voice-samples/{user_id}/sample_{n}.wav"
+    )
+    storage_url      = models.TextField(
+        blank=True, default="",
+        help_text="Signed URL (refreshed on demand — not stored permanently)"
+    )
+    duration_seconds = models.FloatField(null=True, blank=True)
+    file_size_bytes  = models.PositiveIntegerField(null=True, blank=True)
+    sample_rate      = models.PositiveIntegerField(
+        default=16000,
+        help_text="Expected 16000 Hz (16 kHz mono WAV)"
+    )
+    noise_floor_db   = models.FloatField(
+        null=True, blank=True,
+        help_text="Ambient noise floor measured during upload validation"
+    )
+    uploaded_at      = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table        = "voice_samples"
+        unique_together = [("user", "sample_index")]
+        indexes         = [models.Index(fields=["user", "sample_index"])]
+
+    def __str__(self):
+        return f"VoiceSample({self.user_id}, index={self.sample_index})"
+
+
+class VoiceTrainingJob(models.Model):
+    """
+    Tracks the Celery background task that computes the XTTS speaker embedding.
+    One job per training attempt. A user can re-train by submitting new samples
+    (old samples are replaced; a new job is created).
+    """
+
+    class Status(models.TextChoices):
+        PENDING    = "pending",    "Pending — waiting for Celery worker"
+        PROCESSING = "processing", "Processing — downloading samples and computing embedding"
+        COMPLETED  = "completed",  "Completed — embedding saved to user profile"
+        FAILED     = "failed",     "Failed — see error_message"
+
+    id             = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user           = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="voice_training_jobs",
+    )
+    status         = models.CharField(
+        max_length=12, choices=Status.choices,
+        default=Status.PENDING, db_index=True,
+    )
+    celery_task_id = models.CharField(
+        max_length=64, blank=True, default="",
+        help_text="Celery AsyncResult task ID for status polling"
+    )
+    error_message  = models.TextField(blank=True, default="")
+    samples_count  = models.PositiveSmallIntegerField(default=0)
+    started_at     = models.DateTimeField(null=True, blank=True)
+    completed_at   = models.DateTimeField(null=True, blank=True)
+    created_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "voice_training_jobs"
+        indexes  = [
+            models.Index(fields=["user", "status"]),
+            models.Index(fields=["celery_task_id"]),
+        ]
+
+    def __str__(self):
+        return f"VoiceTrainingJob({self.user_id}, {self.status})"
+
+    def mark_processing(self, celery_task_id: str):
+        self.status         = self.Status.PROCESSING
+        self.celery_task_id = celery_task_id
+        self.started_at     = timezone.now()
+        self.save(update_fields=["status", "celery_task_id", "started_at"])
+
+    def mark_completed(self):
+        self.status       = self.Status.COMPLETED
+        self.completed_at = timezone.now()
+        self.save(update_fields=["status", "completed_at"])
+
+    def mark_failed(self, reason: str):
+        self.status        = self.Status.FAILED
+        self.error_message = reason
+        self.completed_at  = timezone.now()
+        self.save(update_fields=["status", "error_message", "completed_at"])
+
+    @property
+    def duration_seconds(self) -> float | None:
+        if self.started_at and self.completed_at:
+            return (self.completed_at - self.started_at).total_seconds()
+        return None
+# ===== d:/yaap1/YAAP\backend\apps\voice\serializers.py =====
+"""Voice App Serializers"""
+
+from django.conf import settings
+from rest_framework import serializers
+from .models import VoiceSample, VoiceTrainingJob, VoiceSentence
+
+
+class VoiceSentenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = VoiceSentence
+        fields = ["id", "language", "sentence", "position"]
+        read_only_fields = fields
+
+
+class VoiceSampleUploadSerializer(serializers.Serializer):
+    """Validates an incoming voice sample upload."""
+    audio_file   = serializers.FileField()
+    sample_index = serializers.IntegerField(min_value=1, max_value=settings.YAAP_MAX_VOICE_SAMPLES)
+    sentence_id  = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_audio_file(self, value):
+        allowed_types = {"audio/wav", "audio/wave", "audio/x-wav", "audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg"}
+        if value.content_type not in allowed_types:
+            raise serializers.ValidationError(
+                f"Unsupported audio format '{value.content_type}'. Upload WAV, WebM, OGG, or MP4."
+            )
+        max_bytes = 50 * 1024 * 1024  # 50 MB
+        if value.size > max_bytes:
+            raise serializers.ValidationError("Audio file exceeds 50 MB limit.")
+        return value
+
+
+class VoiceSampleSerializer(serializers.ModelSerializer):
+    sentence = VoiceSentenceSerializer(read_only=True)
+
+    class Meta:
+        model  = VoiceSample
+        fields = ["id", "sample_index", "sentence", "duration_seconds",
+                  "file_size_bytes", "noise_floor_db", "uploaded_at"]
+        read_only_fields = fields
+
+
+class VoiceTrainingJobSerializer(serializers.ModelSerializer):
+    duration_seconds = serializers.SerializerMethodField()
+    progress_percent = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = VoiceTrainingJob
+        fields = ["id", "status", "samples_count", "error_message",
+                  "started_at", "completed_at", "created_at",
+                  "duration_seconds", "progress_percent"]
+        read_only_fields = fields
+
+    def get_duration_seconds(self, obj):
+        return obj.duration_seconds
+
+    def get_progress_percent(self, obj):
+        mapping = {
+            VoiceTrainingJob.Status.PENDING:    10,
+            VoiceTrainingJob.Status.PROCESSING: 50,
+            VoiceTrainingJob.Status.COMPLETED:  100,
+            VoiceTrainingJob.Status.FAILED:     0,
+        }
+        return mapping.get(obj.status, 0)
+
+
+class VoiceStatusSerializer(serializers.Serializer):
+    """Full training status response returned to the Kotlin app."""
+    voice_trained        = serializers.BooleanField()
+    samples_uploaded     = serializers.IntegerField()
+    samples_required     = serializers.IntegerField()
+    all_samples_uploaded = serializers.BooleanField()
+    active_job           = VoiceTrainingJobSerializer(allow_null=True)
+    samples              = VoiceSampleSerializer(many=True)
+# ===== d:/yaap1/YAAP\backend\apps\voice\urls.py =====
+from django.urls import path
+from .views import (
+    VoiceSentencesView,
+    VoiceSampleUploadView,
+    VoiceSampleDeleteView,
+    VoiceTrainView,
+    VoiceStatusView,
+    VoiceResetView,
+)
+
+urlpatterns = [
+    path("sentences/",              VoiceSentencesView.as_view(),      name="voice-sentences"),
+    path("samples/",                VoiceSampleUploadView.as_view(),   name="voice-sample-upload"),
+    path("samples/<int:sample_index>/", VoiceSampleDeleteView.as_view(), name="voice-sample-delete"),
+    path("train/",                  VoiceTrainView.as_view(),          name="voice-train"),
+    path("status/",                 VoiceStatusView.as_view(),         name="voice-status"),
+    path("reset/",                  VoiceResetView.as_view(),          name="voice-reset"),
+]
+# ===== d:/yaap1/YAAP\backend\apps\voice\views.py =====
+"""
+Voice App Views
+"""
+import logging
+from django.conf import settings
+from django.db import transaction
+from drf_spectacular.utils import extend_schema
+from rest_framework import status
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import VoiceSample, VoiceSentence, VoiceTrainingJob
+from .serializers import (
+    VoiceSampleSerializer, VoiceSampleUploadSerializer,
+    VoiceSentenceSerializer, VoiceTrainingJobSerializer,
+)
+
+logger = logging.getLogger(__name__)
+def _ok(d, sc=status.HTTP_200_OK): return Response({"success": True, "data": d}, status=sc)
+def _err(c, m, sc=status.HTTP_400_BAD_REQUEST): return Response({"success": False, "error": {"code": c, "message": m}}, status=sc)
+
+
+class VoiceSentencesView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request):
+        lang = request.user.language_preference
+        qs   = VoiceSentence.objects.for_language(lang)
+        if not qs.exists():
+            lang = "en"
+            qs   = VoiceSentence.objects.for_language(lang)
+        if not qs.exists():
+            return _err("NO_SENTENCES", "Training sentences not found.", status.HTTP_503_SERVICE_UNAVAILABLE)
+        return _ok({"language": lang, "language_name": settings.YAAP_LANGUAGE_NAMES.get(lang, lang),
+                    "sentences": VoiceSentenceSerializer(qs, many=True).data, "total_required": settings.YAAP_MAX_VOICE_SAMPLES})
+
+
+class VoiceSampleUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+    def post(self, request):
+        s = VoiceSampleUploadSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        audio_file   = s.validated_data["audio_file"]
+        sample_index = s.validated_data["sample_index"]
+        sentence_id  = s.validated_data.get("sentence_id")
+        from services.audio_processing import validate_and_process_wav
+        raw_bytes = audio_file.read()
+        result    = validate_and_process_wav(raw_bytes, filename=audio_file.name)
+        if not result["ok"]:
+            return _err("INVALID_AUDIO", result["error"])
+        storage_path = f"{request.user.id}/sample_{sample_index}.wav"
+        try:
+            from services.supabase_client import upload_file
+            upload_file(settings.SUPABASE_STORAGE_BUCKET_VOICE_SAMPLES, storage_path, result["processed_bytes"], "audio/wav")
+        except Exception as e:
+            logger.error("Upload failed: %s", e)
+            return _err("UPLOAD_FAILED", "Storage error.", status.HTTP_500_INTERNAL_SERVER_ERROR)
+        sentence = None
+        if sentence_id:
+            try: sentence = VoiceSentence.objects.get(id=sentence_id)
+            except VoiceSentence.DoesNotExist: pass
+        sample, created = VoiceSample.objects.update_or_create(
+            user=request.user, sample_index=sample_index,
+            defaults={"storage_path": storage_path, "sentence": sentence,
+                      "duration_seconds": result["duration"], "file_size_bytes": len(result["processed_bytes"]),
+                      "noise_floor_db": result["noise_floor_db"]},
+        )
+        uploaded_count = VoiceSample.objects.filter(user=request.user).count()
+        return _ok({"sample": VoiceSampleSerializer(sample).data, "samples_uploaded": uploaded_count,
+                    "samples_required": settings.YAAP_MAX_VOICE_SAMPLES,
+                    "all_uploaded": uploaded_count >= settings.YAAP_MAX_VOICE_SAMPLES,
+                    "noise_warning": result["noise_floor_db"] > -40.0,
+                    "noise_floor_db": result["noise_floor_db"]},
+                   status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+class VoiceSampleDeleteView(APIView):
+    permission_classes = [IsAuthenticated]
+    def delete(self, request, sample_index):
+        if not (1 <= sample_index <= settings.YAAP_MAX_VOICE_SAMPLES):
+            return _err("INVALID_INDEX", f"sample_index must be 1-{settings.YAAP_MAX_VOICE_SAMPLES}.")
+        try:
+            sample = VoiceSample.objects.get(user=request.user, sample_index=sample_index)
+        except VoiceSample.DoesNotExist:
+            return _err("NOT_FOUND", "Sample not found.", status.HTTP_404_NOT_FOUND)
+        try:
+            from services.supabase_client import delete_file
+            delete_file(settings.SUPABASE_STORAGE_BUCKET_VOICE_SAMPLES, sample.storage_path)
+        except Exception as e:
+            logger.warning("Storage delete failed: %s", e)
+        sample.delete()
+        return _ok({"message": f"Sample {sample_index} deleted."})
+
+
+class VoiceTrainView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request):
+        user           = request.user
+        uploaded_count = VoiceSample.objects.filter(user=user).count()
+        if uploaded_count < settings.YAAP_MAX_VOICE_SAMPLES:
+            return _err("INSUFFICIENT_SAMPLES",
+                        f"Upload all {settings.YAAP_MAX_VOICE_SAMPLES} samples first. Uploaded: {uploaded_count}.")
+        running = VoiceTrainingJob.objects.filter(
+            user=user, status__in=[VoiceTrainingJob.Status.PENDING, VoiceTrainingJob.Status.PROCESSING]
+        ).first()
+        if running:
+            return _ok({"job": VoiceTrainingJobSerializer(running).data, "message": "Training already in progress."})
+        with transaction.atomic():
+            job = VoiceTrainingJob.objects.create(user=user, samples_count=uploaded_count)
+        from tasks.voice_tasks import train_voice_model
+        task = train_voice_model.apply_async(args=[str(job.id)], queue="voice_training")
+        job.celery_task_id = task.id
+        job.save(update_fields=["celery_task_id"])
+        logger.info("Voice training job: job=%s user=%s task=%s", job.id, user.id, task.id)
+        return _ok({"job": VoiceTrainingJobSerializer(job).data, "message": "Training started."}, status.HTTP_202_ACCEPTED)
+
+
+class VoiceStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request):
+        user       = request.user
+        samples    = VoiceSample.objects.filter(user=user).select_related("sentence").order_by("sample_index")
+        active_job = VoiceTrainingJob.objects.filter(user=user).order_by("-created_at").first()
+        uploaded   = samples.count()
+        return _ok({"voice_trained": user.voice_trained, "samples_uploaded": uploaded,
+                    "samples_required": settings.YAAP_MAX_VOICE_SAMPLES,
+                    "all_samples_uploaded": uploaded >= settings.YAAP_MAX_VOICE_SAMPLES,
+                    "active_job": VoiceTrainingJobSerializer(active_job).data if active_job else None,
+                    "samples": VoiceSampleSerializer(samples, many=True).data})
+
+
+class VoiceResetView(APIView):
+    permission_classes = [IsAuthenticated]
+    def post(self, request):
+        user    = request.user
+        samples = VoiceSample.objects.filter(user=user)
+        from services.supabase_client import delete_file
+        for s in samples:
+            try: delete_file(settings.SUPABASE_STORAGE_BUCKET_VOICE_SAMPLES, s.storage_path)
+            except Exception as e: logger.warning("Storage delete failed: %s", e)
+        with transaction.atomic():
+            samples.delete()
+            VoiceTrainingJob.objects.filter(
+                user=user, status__in=[VoiceTrainingJob.Status.PENDING, VoiceTrainingJob.Status.PROCESSING]
+            ).update(status=VoiceTrainingJob.Status.FAILED, error_message="Reset by user.")
+            user.voice_trained   = False
+            user.voice_embedding = None
+            user.save(update_fields=["voice_trained", "voice_embedding"])
+        return _ok({"message": "Voice profile reset. Please re-record."})
+# ===== d:/yaap1/YAAP\backend\apps\voice\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\voice\management\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\voice\management\commands\load_voice_sentences.py =====
+"""
+Management command: load_voice_sentences
+Seeds the voice_sentences table with 5 training sentences per language.
+Run once after first migration:
+  python manage.py load_voice_sentences
+  python manage.py load_voice_sentences --language ar  # seed one language only
+"""
+
+from django.core.management.base import BaseCommand
+from apps.voice.models import VoiceSentence
+
+SENTENCES = {
+    "en": [
+        "The quick brown fox jumps over the lazy dog near the riverbank.",
+        "She sells seashells by the seashore every morning before sunrise.",
+        "Technology is changing the way we communicate across the world.",
+        "The weather today is perfect for a long walk in the park.",
+        "I enjoy reading books and listening to music in my free time.",
+    ],
+    "ar": [
+        "الثعلب البني السريع يقفز فوق الكلب الكسول بالقرب من النهر.",
+        "التكنولوجيا تغير طريقة تواصلنا مع بعضنا البعض حول العالم.",
+        "أستمتع بقراءة الكتب والاستماع إلى الموسيقى في وقت الفراغ.",
+        "الطقس اليوم رائع للتنزه في الحديقة مع العائلة والأصدقاء.",
+        "أتعلم لغات جديدة لأتواصل مع أشخاص من ثقافات مختلفة حول العالم.",
+    ],
+    "es": [
+        "El veloz zorro marrón salta sobre el perro perezoso junto al río.",
+        "La tecnología está cambiando la forma en que nos comunicamos en todo el mundo.",
+        "Me gusta leer libros y escuchar música en mi tiempo libre.",
+        "El tiempo hoy es perfecto para dar un largo paseo por el parque.",
+        "Aprendo idiomas para comunicarme con personas de diferentes culturas.",
+    ],
+    "fr": [
+        "Le rapide renard brun saute par-dessus le chien paresseux près de la rivière.",
+        "La technologie change notre façon de communiquer dans le monde entier.",
+        "J'aime lire des livres et écouter de la musique pendant mon temps libre.",
+        "Le temps aujourd'hui est parfait pour une longue promenade dans le parc.",
+        "J'apprends de nouvelles langues pour parler avec des personnes de cultures différentes.",
+    ],
+    "de": [
+        "Der schnelle braune Fuchs springt über den faulen Hund am Flussufer.",
+        "Technologie verändert die Art und Weise, wie wir miteinander kommunizieren.",
+        "Ich lese gerne Bücher und höre Musik in meiner Freizeit.",
+        "Das Wetter heute ist perfekt für einen langen Spaziergang im Park.",
+        "Ich lerne neue Sprachen, um mit Menschen aus verschiedenen Kulturen zu kommunizieren.",
+    ],
+    "it": [
+        "La rapida volpe marrone salta sopra il cane pigro vicino al fiume.",
+        "La tecnologia sta cambiando il modo in cui comunichiamo in tutto il mondo.",
+        "Mi piace leggere libri e ascoltare musica nel mio tempo libero.",
+        "Il tempo oggi è perfetto per una lunga passeggiata nel parco.",
+        "Imparo nuove lingue per comunicare con persone di culture diverse.",
+    ],
+    "pt": [
+        "A rápida raposa marrom pula sobre o cão preguiçoso perto do rio.",
+        "A tecnologia está mudando a forma como nos comunicamos em todo o mundo.",
+        "Eu gosto de ler livros e ouvir música no meu tempo livre.",
+        "O tempo hoje está perfeito para uma longa caminhada no parque.",
+        "Aprendo idiomas para me comunicar com pessoas de diferentes culturas.",
+    ],
+    "pl": [
+        "Szybki brązowy lis przeskakuje przez leniwego psa przy rzece.",
+        "Technologia zmienia sposób, w jaki komunikujemy się na całym świecie.",
+        "Lubię czytać książki i słuchać muzyki w wolnym czasie.",
+        "Pogoda dzisiaj jest idealna na długi spacer po parku.",
+        "Uczę się nowych języków, aby komunikować się z ludźmi z różnych kultur.",
+    ],
+    "tr": [

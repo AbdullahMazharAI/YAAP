@@ -79,11 +79,15 @@ def _try_deepl(text: str, target_language: str, source_language: str = None) -> 
 
     try:
         import deepl
+        deepl_source = DEEPL_LANG_MAP.get(source_language) if source_language else None
+        if deepl_source:
+            deepl_source = deepl_source.split('-')[0]
+
         translator = deepl.Translator(api_key)
         result     = translator.translate_text(
             text,
             target_lang  = deepl_target,
-            source_lang  = DEEPL_LANG_MAP.get(source_language) if source_language else None,
+            source_lang  = deepl_source,
         )
         logger.info("DeepL translation: %s → %s (%d chars)", source_language, target_language, len(text))
         return result.text

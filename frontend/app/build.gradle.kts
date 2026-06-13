@@ -19,9 +19,10 @@ android {
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Base URL - change for physical device to LAN IP
-        buildConfigField("String", "BASE_URL", "\"http://127.0.0.1:8000/\"")
-        buildConfigField("String", "WS_BASE_URL", "\"ws://127.0.0.1:8000\"")
+        // Base URL — Using 127.0.0.1 (localhost) via ADB reverse port forwarding
+        // (works for physical devices connected via USB)
+        buildConfigField("String", "BASE_URL", "\"http://127.0.0.1:8080/\"")
+        buildConfigField("String", "WS_BASE_URL", "\"ws://127.0.0.1:8080\"")
     }
 
     buildTypes {

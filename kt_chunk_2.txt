@@ -1,0 +1,800 @@
+    @SerializedName("ws_url") val wsUrl: String
+)
+
+data class IceConfigDataResponse(
+    @SerializedName("ice_servers") val iceServers: List<IceServer>,
+    val username: String,
+    val credential: String,
+    @SerializedName("expires_at") val expiresAt: String,
+    @SerializedName("room_id") val roomId: String
+)
+
+data class CallHistoryDataResponse(
+    val calls: List<Map<String, Any>>,
+    val total: Int,
+    val page: Int,
+    @SerializedName("page_size") val pageSize: Int,
+    @SerializedName("has_more") val hasMore: Boolean
+)
+
+data class ActiveCallDataResponse(
+    @SerializedName("active_call") val activeCall: Map<String, Any>?
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  FCM Device
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class RegisterDeviceRequest(
+    @SerializedName("fcm_token") val fcmToken: String,
+    @SerializedName("device_name") val deviceName: String
+)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  Generic
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+data class ApiError(val message: String, val detail: String?)
+data class MessageResponse(val message: String)
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\service\YaapFirebaseMessagingService.kt =====
+package com.yaap.app.service
+
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.google.firebase.messaging.FirebaseMessagingService
+import com.google.firebase.messaging.RemoteMessage
+import com.yaap.app.R
+import com.yaap.app.data.api.YaapApiService
+import com.yaap.app.model.RegisterDeviceRequest
+import com.yaap.app.ui.call.CallActivity
+import com.yaap.app.ui.chat.ChatActivity
+import com.yaap.app.ui.friends.FriendshipActivity
+import com.yaap.app.ui.main.MainActivity
+import com.yaap.app.utils.Constants
+import com.yaap.app.utils.TokenManager
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class YaapFirebaseMessagingService : FirebaseMessagingService() {
+
+    @Inject lateinit var apiService: YaapApiService
+    @Inject lateinit var tokenManager: TokenManager
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    companion object {
+        private const val TAG = "YaapFCM"
+    }
+
+    /**
+     * Called when FCM generates a new registration token.
+     * Posts the token to the backend so push notifications can be sent to this device.
+     */
+    override fun onNewToken(token: String) {
+        super.onNewToken(token)
+        Log.d(TAG, "New FCM token received")
+
+        // Only register if the user is logged in (has an access token)
+        if (tokenManager.hasValidToken()) {
+            serviceScope.launch {
+                try {
+                    val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
+                    val response = apiService.registerDevice(
+                        RegisterDeviceRequest(fcmToken = token, deviceName = deviceName)
+                    )
+                    if (response.isSuccessful) {
+                        Log.d(TAG, "FCM token registered with backend")
+                    } else {
+                        Log.w(TAG, "FCM token registration failed: ${response.code()}")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "FCM token registration error", e)
+                }
+            }
+        } else {
+            Log.d(TAG, "User not logged in, skipping FCM token registration")
+        }
+    }
+
+    override fun onMessageReceived(message: RemoteMessage) {
+        super.onMessageReceived(message)
+        val data = message.data
+        when (data["type"]) {
+            Constants.NOTIF_MESSAGE -> handleMessageNotification(data)
+            Constants.NOTIF_CALL -> handleCallNotification(data)
+            Constants.NOTIF_FRIEND_REQUEST -> handleFriendRequestNotification(data)
+            Constants.NOTIF_VOICE_TRAINED -> handleVoiceTrainedNotification()
+            Constants.NOTIF_MISSED_CALL -> handleMissedCallNotification(data)
+        }
+    }
+
+    private fun handleMessageNotification(data: Map<String, String>) {
+        val conversationId = data["conversation_id"] ?: return
+        val senderName = data["sender_name"] ?: "Someone"
+        val preview = data["preview"] ?: "Sent you a message"
+
+        val intent = Intent(this, ChatActivity::class.java)
+            .putExtra(Constants.EXTRA_CONVERSATION_ID, conversationId)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+
+        val pendingIntent = PendingIntent.getActivity(
+            this, conversationId.hashCode(), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        showNotification(
+            id = conversationId.hashCode(),
+            channel = Constants.CHANNEL_MESSAGES,
+            title = senderName,
+            body = preview,
+            pendingIntent = pendingIntent
+        )
+    }
+
+    private fun handleCallNotification(data: Map<String, String>) {
+        val roomId = data["room_id"] ?: return
+        val callerName = data["caller_name"] ?: "Someone"
+        val callerAvatar = data["caller_avatar"]
+
+        val intent = Intent(this, CallActivity::class.java).apply {
+            putExtra(Constants.EXTRA_ROOM_ID, roomId)
+            putExtra(Constants.EXTRA_IS_INCOMING, true)
+            putExtra(Constants.EXTRA_CALLER_NAME, callerName)
+            putExtra(Constants.EXTRA_CALLER_AVATAR, callerAvatar)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            this, roomId.hashCode(), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, Constants.CHANNEL_CALLS)
+            .setSmallIcon(R.drawable.ic_call)
+            .setContentTitle("Incoming Call")
+            .setContentText("$callerName is calling…")
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setFullScreenIntent(pendingIntent, true)
+            .setAutoCancel(true)
+            .build()
+
+        getSystemService(NotificationManager::class.java)
+            .notify(roomId.hashCode(), notification)
+    }
+
+    private fun handleFriendRequestNotification(data: Map<String, String>) {
+        val requesterName = data["requester_name"] ?: "Someone"
+
+        val intent = Intent(this, FriendshipActivity::class.java)
+            .putExtra(Constants.EXTRA_FRIENDSHIP_TAB, 1)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+
+        val pendingIntent = PendingIntent.getActivity(
+            this, "friend_request".hashCode(), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        showNotification(
+            id = "friend_request".hashCode(),
+            channel = Constants.CHANNEL_SOCIAL,
+            title = "Friend Request",
+            body = "$requesterName wants to connect with you",
+            pendingIntent = pendingIntent
+        )
+    }
+
+    private fun handleVoiceTrainedNotification() {
+        val intent = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pendingIntent = PendingIntent.getActivity(
+            this, "voice_trained".hashCode(), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        showNotification(
+            id = "voice_trained".hashCode(),
+            channel = Constants.CHANNEL_SYSTEM,
+            title = "Voice Training Complete",
+            body = "Your voice model is ready. Start making translated calls!",
+            pendingIntent = pendingIntent
+        )
+    }
+
+    private fun handleMissedCallNotification(data: Map<String, String>) {
+        val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pendingIntent = PendingIntent.getActivity(
+            this, "missed_call".hashCode(), intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        showNotification(
+            id = "missed_call".hashCode(),
+            channel = Constants.CHANNEL_CALLS,
+            title = "Missed Call",
+            body = "You missed a call",
+            pendingIntent = pendingIntent
+        )
+    }
+
+    private fun showNotification(
+        id: Int,
+        channel: String,
+        title: String,
+        body: String,
+        pendingIntent: PendingIntent
+    ) {
+        val notification = NotificationCompat.Builder(this, channel)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        getSystemService(NotificationManager::class.java).notify(id, notification)
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\auth\AuthActivity.kt =====
+package com.yaap.app.ui.auth
+
+import android.content.Intent
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+import androidx.fragment.app.Fragment
+import androidx.viewpager2.adapter.FragmentStateAdapter
+import com.google.android.material.tabs.TabLayoutMediator
+import com.yaap.app.databinding.ActivityAuthBinding
+import com.yaap.app.ui.main.MainActivity
+import dagger.hilt.android.AndroidEntryPoint
+
+@AndroidEntryPoint
+class AuthActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityAuthBinding
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityAuthBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        setupViewPager()
+
+        // ── DEV ONLY: skip auth and go straight to MainActivity ──────
+        // Uncomment the lines below to bypass login during UI testing.
+        // Comment them back out before building for production.
+        //
+        //binding.root.postDelayed({
+         //startActivity(Intent(this, MainActivity::class.java))
+            // finish()
+         //}, 300)
+        // ─────────────────────────────────────────────────────────────
+    }
+
+    private fun setupViewPager() {
+        val tabs = listOf("Login", "Sign Up")//"OTP"
+        val fragments: List<() -> Fragment> = listOf(
+            { LoginFragment() },
+            { SignUpFragment() }
+            //{ OtpFragment() }
+        )
+
+        binding.viewPager.adapter = object : FragmentStateAdapter(this) {
+            override fun getItemCount() = tabs.size
+            override fun createFragment(position: Int) = fragments[position]()
+        }
+
+        TabLayoutMediator(binding.tabLayout, binding.viewPager) { tab, position ->
+            tab.text = tabs[position]
+        }.attach()
+    }
+
+    /** Called by child fragments after successful auth to route per next_step */
+    fun navigatePerNextStep(nextStep: String) {
+        val cls = when (nextStep) {
+            "personal_details"   -> com.yaap.app.ui.onboarding.PersonalDetailsActivity::class.java
+            "language_selection" -> com.yaap.app.ui.onboarding.LanguageSelectionActivity::class.java
+            "voice_training"     -> com.yaap.app.ui.onboarding.VoiceTrainingActivity::class.java
+            else                 -> MainActivity::class.java
+        }
+        startActivity(Intent(this, cls).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        })
+        finish()
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\auth\AuthViewModel.kt =====
+package com.yaap.app.ui.auth
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.yaap.app.data.repository.AuthRepository
+import com.yaap.app.model.AuthResponse
+import com.yaap.app.model.PasswordStrengthResponse
+import com.yaap.app.utils.Result
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class AuthViewModel @Inject constructor(
+    private val repo: AuthRepository
+) : ViewModel() {
+
+    private val _authState = MutableStateFlow<Result<AuthResponse>>(Result.Idle)
+    val authState: StateFlow<Result<AuthResponse>> = _authState.asStateFlow()
+
+    private val _otpRequestState = MutableStateFlow<Result<Unit>>(Result.Idle)
+    val otpRequestState: StateFlow<Result<Unit>> = _otpRequestState.asStateFlow()
+
+    private val _passwordStrength = MutableStateFlow<PasswordStrengthResponse?>(null)
+    val passwordStrength: StateFlow<PasswordStrengthResponse?> = _passwordStrength.asStateFlow()
+
+    fun login(email: String, password: String) {
+        viewModelScope.launch {
+            _authState.value = Result.Loading
+            val result = repo.login(email, password)
+            if (result is Result.Success) {
+                repo.saveTokens(result.data.accessToken, result.data.refreshToken)
+            }
+            _authState.value = result
+        }
+    }
+
+    fun signup(email: String, password: String, fullName: String) {
+        viewModelScope.launch {
+            _authState.value = Result.Loading
+            val result = repo.signup(email, password, fullName)
+            if (result is Result.Success) {
+                repo.saveTokens(result.data.accessToken, result.data.refreshToken)
+            }
+            _authState.value = result
+        }
+    }
+
+    fun requestOtp(email: String) {
+        viewModelScope.launch {
+            _otpRequestState.value = Result.Loading
+            val result = repo.requestOtp(email)
+            _otpRequestState.value = if (result is Result.Success) Result.Success(Unit)
+            else Result.Error((result as Result.Error).message)
+        }
+    }
+
+    fun verifyOtp(email: String, otp: String) {
+        viewModelScope.launch {
+            _authState.value = Result.Loading
+            val result = repo.verifyOtp(email, otp)
+            if (result is Result.Success) {
+                repo.saveTokens(result.data.accessToken, result.data.refreshToken)
+            }
+            _authState.value = result
+        }
+    }
+
+    fun googleAuth(idToken: String) {
+        viewModelScope.launch {
+            _authState.value = Result.Loading
+            val result = repo.googleAuth(idToken)
+            if (result is Result.Success) {
+                repo.saveTokens(result.data.accessToken, result.data.refreshToken)
+            }
+            _authState.value = result
+        }
+    }
+
+    fun checkPasswordStrength(password: String) {
+        viewModelScope.launch {
+            val result = repo.checkPasswordStrength(password)
+            if (result is Result.Success) _passwordStrength.value = result.data
+        }
+    }
+
+    fun resetPasswordRequest(email: String) {
+        viewModelScope.launch { repo.resetPassword(email) }
+    }
+
+    fun resetState() { _authState.value = Result.Idle }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\auth\LoginFragment.kt =====
+package com.yaap.app.ui.auth
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
+import com.yaap.app.R
+import com.yaap.app.databinding.FragmentLoginBinding
+import com.yaap.app.utils.Result
+import com.yaap.app.utils.isValidEmail
+import com.yaap.app.utils.isValidPassword
+import com.yaap.app.utils.showSnackbarError
+import com.yaap.app.utils.textString
+import kotlinx.coroutines.launch
+
+class LoginFragment : Fragment() {
+
+    private var _binding: FragmentLoginBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: AuthViewModel by activityViewModels()
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = FragmentLoginBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupValidation()
+        setupClickListeners()
+        observeState()
+    }
+
+    private fun setupValidation() {
+        binding.etEmail.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                val email = binding.etEmail.textString()
+                if (email.isNotEmpty() && !email.isValidEmail())
+                    binding.tilEmail.error = "Invalid email address"
+                else binding.tilEmail.error = null
+            }
+            updateSubmitButton()
+        }
+        binding.etPassword.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) {
+                val pwd = binding.etPassword.textString()
+                if (pwd.isNotEmpty() && !pwd.isValidPassword())
+                    binding.tilPassword.error = "Min ${com.yaap.app.utils.Constants.MIN_PASSWORD_LENGTH} characters"
+                else binding.tilPassword.error = null
+            }
+            updateSubmitButton()
+        }
+        binding.etEmail.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { updateSubmitButton() }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+        binding.etPassword.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { updateSubmitButton() }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+    }
+
+    private fun updateSubmitButton() {
+        val emailOk = binding.etEmail.textString().isValidEmail()
+        val pwdOk = binding.etPassword.textString().isValidPassword()
+        binding.btnLogin.isEnabled = emailOk && pwdOk
+    }
+
+    private fun setupClickListeners() {
+        binding.btnLogin.setOnClickListener {
+            viewModel.login(binding.etEmail.textString(), binding.etPassword.textString())
+        }
+        binding.btnForgotPassword.setOnClickListener {
+            val email = binding.etEmail.textString()
+            if (email.isValidEmail()) {
+                viewModel.resetPasswordRequest(email)
+                com.google.android.material.dialog.MaterialAlertDialogBuilder(requireContext())
+                    .setTitle("Password Reset")
+                    .setMessage("If an account exists for $email, you will receive reset instructions shortly.")
+                    .setPositiveButton("OK", null)
+                    .show()
+            } else {
+                binding.tilEmail.error = "Enter your email first"
+            }
+        }
+        binding.btnGoogleSignIn.setOnClickListener {
+            (activity as? AuthActivity)?.let { /* Google Sign-In handled in AuthActivity */ }
+            launchGoogleSignIn()
+        }
+    }
+
+    private fun launchGoogleSignIn() {
+        // Google Sign-In requires GoogleSignInClient setup with web_client_id from google-services.json
+        // This is a placeholder — wire up in AuthActivity with proper GoogleSignInClient
+        binding.root.showSnackbarError("Configure google-services.json to enable Google Sign-In")
+    }
+
+    private fun observeState() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.authState.collect { state ->
+                when (state) {
+                    is Result.Loading -> {
+                        binding.btnLogin.isEnabled = false
+                        binding.progressBar.visibility = View.VISIBLE
+                    }
+                    is Result.Success -> {
+                        binding.progressBar.visibility = View.GONE
+                        viewModel.resetState()
+                        (activity as? AuthActivity)?.navigatePerNextStep(state.data.nextStep)
+                    }
+                    is Result.Error -> {
+                        binding.progressBar.visibility = View.GONE
+                        binding.btnLogin.isEnabled = true
+                        binding.root.showSnackbarError(state.message)
+                        viewModel.resetState()
+                    }
+                    else -> {
+                        binding.progressBar.visibility = View.GONE
+                        updateSubmitButton()
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\auth\OtpFragment.kt =====
+package com.yaap.app.ui.auth
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
+import com.yaap.app.databinding.FragmentOtpBinding
+import com.yaap.app.utils.Result
+import com.yaap.app.utils.isValidEmail
+import com.yaap.app.utils.showSnackbarError
+import com.yaap.app.utils.textString
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+class OtpFragment : Fragment() {
+    private var _binding: FragmentOtpBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: AuthViewModel by activityViewModels()
+    private var timerJob: Job? = null
+    private var currentEmail: String = ""
+    private val otpBoxes: List<EditText> by lazy {
+        listOf(
+            binding.otpBox1, binding.otpBox2, binding.otpBox3,
+            binding.otpBox4, binding.otpBox5, binding.otpBox6
+        )
+    }
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, s: Bundle?): View {
+        _binding = FragmentOtpBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        setupOtpBoxes()
+        setupClickListeners()
+        observeState()
+        binding.otpContainer.visibility = View.GONE
+    }
+
+    private fun setupOtpBoxes() {
+        otpBoxes.forEachIndexed { index, box ->
+            box.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    if (s?.length == 1 && index < otpBoxes.size - 1) {
+                        otpBoxes[index + 1].requestFocus()
+                    }
+                    // Auto-submit on last digit
+                    if (index == otpBoxes.size - 1 && s?.length == 1) {
+                        val otp = otpBoxes.joinToString("") { it.textString() }
+                        if (otp.length == 6) viewModel.verifyOtp(currentEmail, otp)
+                    }
+                }
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            })
+            // Handle backspace to go to previous box
+            box.setOnKeyListener { _, keyCode, event ->
+                if (keyCode == android.view.KeyEvent.KEYCODE_DEL &&
+                    event.action == android.view.KeyEvent.ACTION_DOWN &&
+                    box.textString().isEmpty() && index > 0) {
+                    otpBoxes[index - 1].requestFocus()
+                    otpBoxes[index - 1].setText("")
+                    true
+                } else false
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.btnSendCode.setOnClickListener {
+            val email = binding.etEmail.textString()
+            if (!email.isValidEmail()) {
+                binding.tilEmail.error = "Enter a valid email"
+                return@setOnClickListener
+            }
+            currentEmail = email
+            viewModel.requestOtp(email)
+        }
+
+        binding.btnResendCode.setOnClickListener {
+            if (currentEmail.isNotEmpty()) viewModel.requestOtp(currentEmail)
+        }
+    }
+
+    private fun startCountdown() {
+        timerJob?.cancel()
+        val totalSeconds = 10 * 60 // 10 minutes
+        timerJob = viewLifecycleOwner.lifecycleScope.launch {
+            var remaining = totalSeconds
+            while (remaining > 0) {
+                val mins = remaining / 60
+                val secs = remaining % 60
+                binding.tvCountdown.text = String.format("%02d:%02d", mins, secs)
+                delay(1000)
+                remaining--
+            }
+            binding.tvCountdown.text = "Code expired"
+            binding.btnResendCode.isEnabled = true
+        }
+    }
+
+    private fun observeState() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.otpRequestState.collect { state ->
+                when (state) {
+                    is Result.Success -> {
+                        binding.otpContainer.visibility = View.VISIBLE
+                        binding.btnResendCode.isEnabled = false
+                        startCountdown()
+                        otpBoxes[0].requestFocus()
+                    }
+                    is Result.Error -> binding.root.showSnackbarError(state.message)
+                    else -> {}
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.authState.collect { state ->
+                when (state) {
+                    is Result.Loading -> binding.progressBar.visibility = View.VISIBLE
+                    is Result.Success -> {
+                        binding.progressBar.visibility = View.GONE
+                        viewModel.resetState()
+                        (activity as? AuthActivity)?.navigatePerNextStep(state.data.nextStep)
+                    }
+                    is Result.Error -> {
+                        binding.progressBar.visibility = View.GONE
+                        binding.root.showSnackbarError(state.message)
+                        viewModel.resetState()
+                    }
+                    else -> binding.progressBar.visibility = View.GONE
+                }
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        timerJob?.cancel()
+        super.onDestroyView()
+        _binding = null
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\auth\SignUpFragment.kt =====
+package com.yaap.app.ui.auth
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
+import com.yaap.app.R
+import com.yaap.app.databinding.FragmentSignupBinding
+import com.yaap.app.utils.Result
+import com.yaap.app.utils.isValidEmail
+import com.yaap.app.utils.isValidPassword
+import com.yaap.app.utils.showSnackbarError
+import com.yaap.app.utils.textString
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.launch
+
+class SignUpFragment : Fragment() {
+    private var _binding: FragmentSignupBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: AuthViewModel by activityViewModels()
+    private val passwordFlow = MutableStateFlow("")
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, s: Bundle?): View {
+        _binding = FragmentSignupBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    @OptIn(FlowPreview::class)
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        // ── DEV ONLY: prefill test data — remove before production ──
+        prefillTestData()
+        // ────────────────────────────────────────────────────────────
+
+        // Debounced password strength check
+        viewLifecycleOwner.lifecycleScope.launch {
+            passwordFlow.debounce(300).collect { pwd ->
+                if (pwd.length >= 3) viewModel.checkPasswordStrength(pwd)
+            }
+        }
+
+        binding.etPassword.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                passwordFlow.value = s.toString()
+                checkPasswordMatch()
+                updateSubmitButton()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+        binding.etConfirmPassword.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                checkPasswordMatch()
+                updateSubmitButton()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+
+        binding.btnCreateAccount.setOnClickListener {
+            viewModel.signup(
+                binding.etEmail.textString(),
+                binding.etPassword.textString(),
+                binding.etFullName.textString()
+            )
+        }
+
+        // Observe password strength
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.passwordStrength.collect { strength ->
+                strength ?: return@collect
+                updateStrengthBar(strength.score)
+            }
+        }
+
+        // Observe auth state
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.authState.collect { state ->
+                when (state) {
+                    is Result.Loading -> {
+                        binding.btnCreateAccount.isEnabled = false
+                        binding.progressBar.visibility = View.VISIBLE
+                    }
+                    is Result.Success -> {
+                        binding.progressBar.visibility = View.GONE
+                        viewModel.resetState()
+                        (activity as? AuthActivity)?.navigatePerNextStep(state.data.nextStep)
+                    }
+                    is Result.Error -> {
+                        binding.progressBar.visibility = View.GONE
+                        binding.btnCreateAccount.isEnabled = true
+                        binding.root.showSnackbarError(state.message)
+                        viewModel.resetState()
+                    }
+                    else -> {
+                        binding.progressBar.visibility = View.GONE
+                        updateSubmitButton()
+                    }
+                }

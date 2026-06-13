@@ -1,0 +1,800 @@
+        viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>) =
+                ChatActivityViewModel(repo, tokenManager, conversationId, okHttpClient) as T
+        })[ChatActivityViewModel::class.java]
+
+        setupRecyclerView()
+        setupInputBar()
+        setupToolbar()
+        observeState()
+
+        viewModel.connectWebSocket()
+    }
+
+    private fun setupRecyclerView() {
+        adapter = MessageAdapter(currentUserId)
+        val layoutManager = LinearLayoutManager(this).apply { stackFromEnd = true }
+        binding.rvMessages.layoutManager = layoutManager
+        binding.rvMessages.adapter = adapter
+
+        binding.rvMessages.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+                if (!rv.canScrollVertically(-1)) viewModel.loadMoreHistory()
+            }
+        })
+    }
+
+    private fun setupInputBar() {
+        binding.etMessage.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                binding.btnSend.isEnabled = !s.isNullOrBlank()
+                if (!s.isNullOrBlank()) viewModel.notifyTypingStart()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+        binding.btnSend.setOnClickListener {
+            val text = binding.etMessage.text.toString().trim()
+            if (text.isNotEmpty()) {
+                viewModel.sendMessage(text)
+                binding.etMessage.setText("")
+            }
+        }
+    }
+
+    private fun setupToolbar() {
+        binding.btnBack.setOnClickListener { finish() }
+        binding.btnCall.setOnClickListener {
+            startActivity(Intent(this, com.yaap.app.ui.call.CallActivity::class.java))
+        }
+    }
+
+    private fun observeState() {
+        // Observe Room DB — reactive list that auto-updates when messages are inserted/updated
+        lifecycleScope.launch {
+            viewModel.messages.collect { messages ->
+                adapter.submitList(messages.reversed())
+                if (messages.isNotEmpty()) binding.rvMessages.scrollToPosition(messages.size - 1)
+            }
+        }
+
+        // Process WebSocket events and persist to Room DB
+        lifecycleScope.launch {
+            viewModel.wsEvents.collect { json ->
+                handleWebSocketEvent(json)
+            }
+        }
+    }
+
+    /**
+     * Central handler for all WebSocket events.
+     * Parses the JSON payload and persists changes into Room DB,
+     * which triggers the reactive Flow to update the UI automatically.
+     */
+    private fun handleWebSocketEvent(json: JSONObject) {
+        val type = json.optString("type")
+        val payload = json.optJSONObject("payload")
+
+        Log.d(TAG, "WS event: $type")
+
+        when (type) {
+            "chat.message_new" -> {
+                // Parse the new message and insert into Room DB
+                if (payload != null) {
+                    val entity = parseMessagePayload(payload)
+                    if (entity != null) {
+                        viewModel.insertMessage(entity)
+                        // Auto-mark as read if the message is from the other user
+                        if (entity.senderId != currentUserId) {
+                            viewModel.markRead(entity.id)
+                        }
+                    }
+                }
+                binding.typingIndicator.visibility = View.GONE
+            }
+
+            "chat.history" -> {
+                // Parse the messages array and insert all into Room DB
+                if (payload != null) {
+                    val messagesArray = payload.optJSONArray("messages")
+                    if (messagesArray != null) {
+                        val entities = parseMessageArray(messagesArray)
+                        if (entities.isNotEmpty()) {
+                            viewModel.insertMessages(entities)
+                        }
+                    }
+                    val cursor = payload.optString("next_cursor").takeIf {
+                        it.isNotBlank() && it != "null"
+                    }
+                    viewModel.nextCursor = cursor
+                }
+            }
+
+            "chat.message_translated" -> {
+                // Real-time translation pushed by backend after Celery task completes
+                if (payload != null) {
+                    val messageId = payload.optString("message_id")
+                    val translatedContent = payload.optString("translated_content")
+                    if (messageId.isNotBlank() && translatedContent.isNotBlank()) {
+                        viewModel.updateTranslation(messageId, translatedContent)
+                    }
+                }
+            }
+
+            "chat.message_deleted" -> {
+                if (payload != null) {
+                    val messageId = payload.optString("message_id")
+                    if (messageId.isNotBlank()) {
+                        viewModel.markMessageDeleted(messageId)
+                    }
+                }
+            }
+
+            "chat.read_receipt" -> {
+                if (payload != null) {
+                    val messageId = payload.optString("message_id")
+                    if (messageId.isNotBlank()) {
+                        viewModel.updateMessageStatus(messageId, "read")
+                    }
+                }
+            }
+
+            "chat.typing_start" -> {
+                binding.typingIndicator.visibility = View.VISIBLE
+            }
+
+            "chat.typing_stop" -> {
+                binding.typingIndicator.visibility = View.GONE
+            }
+
+            "error" -> {
+                val code = payload?.optString("code") ?: "UNKNOWN"
+                val message = payload?.optString("message") ?: "Unknown error"
+                Log.e(TAG, "WS error: $code — $message")
+            }
+        }
+    }
+
+    /**
+     * Parse a single message JSON object (from chat.message_new) into a MessageEntity.
+     * Backend payload shape:
+     *   {"id":"...", "conversation_id":"...", "sender":{"id":"...","display_name":"..."},
+     *    "content":"...", "original_language":"...", "status":"...",
+     *    "deleted_for_everyone":false, "created_at":"...", "updated_at":"..."}
+     */
+    private fun parseMessagePayload(msg: JSONObject): MessageEntity? {
+        return try {
+            val senderId = msg.optJSONObject("sender")?.optString("id")
+                ?: msg.optString("sender_id")
+            MessageEntity(
+                id = msg.getString("id"),
+                conversationId = msg.getString("conversation_id"),
+                senderId = senderId,
+                content = msg.optString("content", ""),
+                translation = null,
+                status = msg.optString("status", "sent"),
+                createdAt = msg.getString("created_at"),
+                deleted = msg.optBoolean("deleted_for_everyone", false)
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse message payload: ${e.message}")
+            null
+        }
+    }
+
+    /** Parse an array of message JSON objects (from chat.history) into MessageEntity list. */
+    private fun parseMessageArray(array: JSONArray): List<MessageEntity> {
+        val entities = mutableListOf<MessageEntity>()
+        for (i in 0 until array.length()) {
+            val msg = array.optJSONObject(i) ?: continue
+            parseMessagePayload(msg)?.let { entities.add(it) }
+        }
+        return entities
+    }
+
+    override fun onDestroy() {
+        viewModel.disconnectWebSocket()
+        super.onDestroy()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  MessageAdapter - two ViewHolder types (sent / received)
+// ────────────────────────────────────────────────────────────────────
+class MessageAdapter(private val currentUserId: String) :
+    ListAdapter<MessageEntity, RecyclerView.ViewHolder>(MSG_DIFF) {
+
+    private val VIEW_SENT = 1
+    private val VIEW_RECEIVED = 2
+
+    override fun getItemViewType(position: Int) =
+        if (getItem(position).senderId == currentUserId) VIEW_SENT else VIEW_RECEIVED
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+        val inflater = LayoutInflater.from(parent.context)
+        return if (viewType == VIEW_SENT) {
+            SentVH(ItemMessageSentBinding.inflate(inflater, parent, false))
+        } else {
+            ReceivedVH(ItemMessageReceivedBinding.inflate(inflater, parent, false))
+        }
+    }
+
+    override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+        val item = getItem(position)
+        when (holder) {
+            is SentVH -> holder.bind(item)
+            is ReceivedVH -> holder.bind(item)
+        }
+    }
+
+    class SentVH(private val b: ItemMessageSentBinding) : RecyclerView.ViewHolder(b.root) {
+        fun bind(msg: MessageEntity) {
+            b.tvContent.text = if (msg.deleted) "This message was deleted." else msg.content
+            b.tvTimestamp.text = msg.createdAt.toMessageTimestamp()
+            b.tvContent.alpha = if (msg.deleted) 0.5f else 1f
+            b.root.setOnLongClickListener {
+                // TODO: show context menu (Copy / Delete for me / Delete for everyone)
+                true
+            }
+        }
+    }
+
+    class ReceivedVH(private val b: ItemMessageReceivedBinding) : RecyclerView.ViewHolder(b.root) {
+        fun bind(msg: MessageEntity) {
+            b.tvContent.text = if (msg.deleted) "This message was deleted." else
+                (msg.translation ?: msg.content)
+            b.tvTimestamp.text = msg.createdAt.toMessageTimestamp()
+            b.tvContent.alpha = if (msg.deleted) 0.5f else 1f
+            b.tvOriginal.visibility = if (msg.translation != null) View.VISIBLE else View.GONE
+            b.tvOriginal.setOnClickListener {
+                android.app.AlertDialog.Builder(b.root.context)
+                    .setTitle("Original message")
+                    .setMessage(msg.content)
+                    .setPositiveButton("Close", null)
+                    .show()
+            }
+        }
+    }
+
+    companion object {
+        val MSG_DIFF = object : DiffUtil.ItemCallback<MessageEntity>() {
+            override fun areItemsTheSame(a: MessageEntity, b: MessageEntity) = a.id == b.id
+            override fun areContentsTheSame(a: MessageEntity, b: MessageEntity) = a == b
+        }
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\chat\ChatListFragment.kt =====
+package com.yaap.app.ui.chat
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.ListAdapter
+import androidx.recyclerview.widget.RecyclerView
+import com.yaap.app.data.local.entity.ConversationEntity
+import com.yaap.app.data.repository.ChatRepository
+import com.yaap.app.databinding.FragmentChatListBinding
+import com.yaap.app.databinding.ItemConversationBinding
+import com.yaap.app.utils.Constants
+import com.yaap.app.utils.Result
+import com.yaap.app.utils.getCurrentTimeInTimezone
+import com.yaap.app.utils.loadAvatar
+import com.yaap.app.utils.toMessageTimestamp
+import dagger.hilt.android.AndroidEntryPoint
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+// ────────────────────────────────────────────────────────────────────
+//  ChatListViewModel
+// ────────────────────────────────────────────────────────────────────
+@HiltViewModel
+class ChatListViewModel @Inject constructor(
+    private val repo: ChatRepository
+) : ViewModel() {
+
+    val conversations: Flow<List<ConversationEntity>> = repo.observeConversations()
+
+    private val _refreshState = MutableStateFlow<Result<*>>(Result.Idle)
+    val refreshState: StateFlow<Result<*>> = _refreshState.asStateFlow()
+
+    init { refresh() }
+
+    fun refresh() {
+        viewModelScope.launch {
+            _refreshState.value = Result.Loading
+            _refreshState.value = repo.refreshConversations()
+        }
+    }
+
+    fun startConversation(userId: String, onSuccess: (String) -> Unit) {
+        viewModelScope.launch {
+            when (val result = repo.startConversation(userId)) {
+                is Result.Success -> onSuccess(result.data.id)
+                else -> {}
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  ChatListFragment
+// ────────────────────────────────────────────────────────────────────
+@AndroidEntryPoint
+class ChatListFragment : Fragment() {
+
+    private var _binding: FragmentChatListBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: ChatListViewModel by viewModels()
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, s: Bundle?): View {
+        _binding = FragmentChatListBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        val adapter = ConversationAdapter { conv ->
+            startActivity(
+                Intent(requireContext(), ChatActivity::class.java)
+                    .putExtra(Constants.EXTRA_CONVERSATION_ID, conv.id)
+            )
+        }
+
+        binding.rvConversations.layoutManager = LinearLayoutManager(requireContext())
+        binding.rvConversations.adapter = adapter
+
+        binding.swipeRefresh.setOnRefreshListener { viewModel.refresh() }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.conversations.collect { list ->
+                adapter.submitList(list)
+                binding.emptyState.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.refreshState.collect { state ->
+                binding.swipeRefresh.isRefreshing = state is Result.Loading
+            }
+        }
+    }
+
+    override fun onDestroyView() { super.onDestroyView(); _binding = null }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  ConversationAdapter
+// ────────────────────────────────────────────────────────────────────
+class ConversationAdapter(
+    private val onClick: (ConversationEntity) -> Unit
+) : ListAdapter<ConversationEntity, ConversationAdapter.VH>(DIFF) {
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+        val binding = ItemConversationBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+        return VH(binding)
+    }
+
+    override fun onBindViewHolder(holder: VH, position: Int) = holder.bind(getItem(position), onClick)
+
+    class VH(private val b: ItemConversationBinding) : RecyclerView.ViewHolder(b.root) {
+        fun bind(item: ConversationEntity, onClick: (ConversationEntity) -> Unit) {
+            b.ivAvatar.loadAvatar(item.otherUserAvatar, item.otherUserName.take(1))
+            b.tvName.text = item.otherUserName
+            b.tvLastMessage.text = item.lastMessageTranslation ?: item.lastMessageContent ?: ""
+            b.tvTimestamp.text = item.lastMessageTimestamp?.toMessageTimestamp() ?: ""
+            b.tvLocalTime.text = item.otherUserTimezone?.let { getCurrentTimeInTimezone(it) } ?: ""
+            b.tvFlag.text = countryToFlag(item.otherUserCountryCode)
+            b.onlineIndicator.visibility = if (item.otherUserOnline) View.VISIBLE else View.GONE
+            if (item.unreadCount > 0) {
+                b.tvUnread.visibility = View.VISIBLE
+                b.tvUnread.text = item.unreadCount.toString()
+            } else {
+                b.tvUnread.visibility = View.GONE
+            }
+            b.root.setOnClickListener { onClick(item) }
+        }
+
+        private fun countryToFlag(code: String?): String {
+            if (code.isNullOrLength2Not()) return ""
+
+            val safeCode = code ?: return ""
+
+            return safeCode.uppercase().map { char ->
+                char.code - 0x41 + 0x1F1E6
+            }.joinToString("") { String(Character.toChars(it)) }
+        }
+
+        private fun String?.isNullOrLength2Not() = this == null || this.length != 2
+    }
+
+    companion object {
+        val DIFF = object : DiffUtil.ItemCallback<ConversationEntity>() {
+            override fun areItemsTheSame(a: ConversationEntity, b: ConversationEntity) = a.id == b.id
+            override fun areContentsTheSame(a: ConversationEntity, b: ConversationEntity) = a == b
+        }
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\common\WaveformView.kt =====
+package com.yaap.app.ui.common
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.util.AttributeSet
+import android.view.View
+import androidx.core.content.ContextCompat
+import com.yaap.app.R
+import kotlin.math.max
+import kotlin.random.Random
+
+/**
+ * Custom View that renders animated waveform bars driven by AudioRecord amplitude.
+ * Call [updateAmplitude] periodically (every 50ms) to animate.
+ */
+class WaveformView @JvmOverloads constructor(
+    context: Context,
+    attrs: AttributeSet? = null,
+    defStyleAttr: Int = 0
+) : View(context, attrs, defStyleAttr) {
+
+    private val barCount = 30
+    private val barWidthFraction = 0.6f   // bar width relative to slot width
+    private val minHeightFraction = 0.08f  // minimum bar height fraction
+    private val amplitudes = FloatArray(barCount) { minHeightFraction }
+    private val targetAmplitudes = FloatArray(barCount) { minHeightFraction }
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ContextCompat.getColor(context, R.color.color_secondary)
+        style = Paint.Style.FILL
+    }
+
+    private val cornerRadius = context.resources.displayMetrics.density * 4f
+
+    fun updateAmplitude(rawAmplitude: Int, maxAmplitude: Int = 32767) {
+        val normalised = (rawAmplitude.toFloat() / maxAmplitude).coerceIn(0f, 1f)
+        // Shift bars left and add new value at end
+        for (i in 0 until barCount - 1) {
+            targetAmplitudes[i] = targetAmplitudes[i + 1]
+        }
+        targetAmplitudes[barCount - 1] = max(minHeightFraction, normalised)
+        // Smooth animation
+        for (i in 0 until barCount) {
+            amplitudes[i] += (targetAmplitudes[i] - amplitudes[i]) * 0.4f
+        }
+        invalidate()
+    }
+
+    /** Call when idle to gently animate random small motion */
+    fun showIdleAnimation() {
+        for (i in 0 until barCount) {
+            targetAmplitudes[i] = Random.nextFloat() * 0.15f + minHeightFraction
+        }
+        invalidate()
+    }
+
+    /** Reset all bars to minimum */
+    fun reset() {
+        amplitudes.fill(minHeightFraction)
+        targetAmplitudes.fill(minHeightFraction)
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (width == 0 || height == 0) return
+
+        val slotWidth = width.toFloat() / barCount
+        val barWidth = slotWidth * barWidthFraction
+
+        amplitudes.forEachIndexed { index, amp ->
+            val barHeight = amp * height
+            val left = index * slotWidth + (slotWidth - barWidth) / 2
+            val top = (height - barHeight) / 2
+            val right = left + barWidth
+            val bottom = top + barHeight
+            canvas.drawRoundRect(left, top, right, bottom, cornerRadius, cornerRadius, paint)
+        }
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\friends\FriendProfileActivity.kt =====
+package com.yaap.app.ui.friends
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.View
+import androidx.activity.viewModels
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import com.yaap.app.R
+import com.yaap.app.data.repository.ChatRepository
+import com.yaap.app.data.repository.FriendRepository
+import com.yaap.app.data.repository.UserRepository
+import com.yaap.app.databinding.ActivityFriendProfileBinding
+import com.yaap.app.model.User
+import com.yaap.app.ui.call.CallActivity
+import com.yaap.app.ui.chat.ChatActivity
+import com.yaap.app.utils.*
+import dagger.hilt.android.AndroidEntryPoint
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class FriendProfileViewModel @Inject constructor(
+    private val userRepo: UserRepository,
+    private val friendRepo: FriendRepository,
+    private val chatRepo: ChatRepository
+) : ViewModel() {
+    private val _user = MutableStateFlow<User?>(null)
+    val user: StateFlow<User?> = _user.asStateFlow()
+
+    private val _event = MutableSharedFlow<String>()
+    val event: SharedFlow<String> = _event
+
+    private val _conversationId = MutableSharedFlow<String>()
+    val conversationId: SharedFlow<String> = _conversationId
+
+    fun loadUser(userId: String) = viewModelScope.launch {
+        when (val r = userRepo.getUserProfile(userId)) {
+            is Result.Success -> _user.value = r.data
+            is Result.Error -> _event.emit(r.message)
+            else -> {}
+        }
+    }
+
+    fun openChat(userId: String) = viewModelScope.launch {
+        when (val r = chatRepo.startConversation(userId)) {
+            is Result.Success -> _conversationId.emit(r.data.id)
+            is Result.Error -> _event.emit(r.message)
+            else -> {}
+        }
+    }
+
+    fun blockUser(userId: String) = viewModelScope.launch {
+        friendRepo.blockUser(userId)
+        _event.emit("User blocked")
+    }
+
+    fun unfriend(friendshipId: String) = viewModelScope.launch {
+        friendRepo.unfriend(friendshipId)
+        _event.emit("Unfriended")
+    }
+}
+
+@AndroidEntryPoint
+class FriendProfileActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityFriendProfileBinding
+    private val viewModel: FriendProfileViewModel by viewModels()
+    private var friendId: String = ""
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityFriendProfileBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        friendId = intent.getStringExtra(Constants.EXTRA_FRIEND_ID) ?: run { finish(); return }
+
+        binding.btnBack.setOnClickListener { finish() }
+        binding.btnCall.setOnClickListener {
+            startActivity(Intent(this, CallActivity::class.java)
+                .putExtra(Constants.EXTRA_FRIEND_ID, friendId))
+        }
+        binding.btnMessage.setOnClickListener { viewModel.openChat(friendId) }
+
+        lifecycleScope.launch {
+            viewModel.user.collect { user ->
+                user ?: return@collect
+                binding.ivAvatar.loadAvatar(user.avatarUrl, user.displayName.take(1))
+                binding.tvName.text = user.displayName
+                binding.tvBio.text = user.bio ?: ""
+                binding.tvBio.visibility = if (user.bio.isNullOrBlank()) View.GONE else View.VISIBLE
+                binding.tvLocalTime.text = user.timezone?.let { getCurrentTimeInTimezone(it) } ?: ""
+                binding.onlineIndicator.visibility = if (user.isOnline) View.VISIBLE else View.GONE
+            }
+        }
+
+        lifecycleScope.launch {
+            viewModel.conversationId.collect { convId ->
+                startActivity(Intent(this@FriendProfileActivity, ChatActivity::class.java)
+                    .putExtra(Constants.EXTRA_CONVERSATION_ID, convId))
+            }
+        }
+
+        lifecycleScope.launch {
+            viewModel.event.collect { msg ->
+                com.google.android.material.snackbar.Snackbar.make(binding.root, msg, com.google.android.material.snackbar.Snackbar.LENGTH_SHORT).show()
+                if (msg == "User blocked" || msg == "Unfriended") finish()
+            }
+        }
+
+        viewModel.loadUser(friendId)
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\friends\FriendshipActivity.kt =====
+package com.yaap.app.ui.friends
+
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.appcompat.app.AppCompatActivity
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.ListAdapter
+import androidx.recyclerview.widget.RecyclerView
+import androidx.viewpager2.adapter.FragmentStateAdapter
+import com.google.android.material.tabs.TabLayoutMediator
+import com.yaap.app.R
+import com.yaap.app.data.repository.FriendRepository
+import com.yaap.app.data.repository.UserRepository
+import com.yaap.app.databinding.*
+import com.yaap.app.model.FriendRequest
+import com.yaap.app.model.Friendship
+import com.yaap.app.model.UserSearchResult
+import com.yaap.app.utils.*
+import dagger.hilt.android.AndroidEntryPoint
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import javax.inject.Inject
+
+// ────────────────────────────────────────────────────────────────────
+//  FriendshipViewModel (shared)
+// ────────────────────────────────────────────────────────────────────
+@HiltViewModel
+class FriendshipViewModel @Inject constructor(
+    private val friendRepo: FriendRepository,
+    private val userRepo: UserRepository
+) : ViewModel() {
+
+    private val _friends = MutableStateFlow<List<Friendship>>(emptyList())
+    val friends: StateFlow<List<Friendship>> = _friends.asStateFlow()
+
+    private val _receivedRequests = MutableStateFlow<List<FriendRequest>>(emptyList())
+    val receivedRequests: StateFlow<List<FriendRequest>> = _receivedRequests.asStateFlow()
+
+    private val _searchResults = MutableStateFlow<List<UserSearchResult>>(emptyList())
+    val searchResults: StateFlow<List<UserSearchResult>> = _searchResults.asStateFlow()
+
+    private val _event = MutableSharedFlow<String>()
+    val event: SharedFlow<String> = _event
+
+    fun loadFriends() = viewModelScope.launch {
+        when (val r = friendRepo.getFriends()) {
+            is Result.Success -> _friends.value = r.data
+            is Result.Error -> _event.emit(r.message)
+            else -> {}
+        }
+    }
+
+    fun loadRequests() = viewModelScope.launch {
+        when (val r = friendRepo.getReceivedRequests()) {
+            is Result.Success -> _receivedRequests.value = r.data
+            is Result.Error -> _event.emit(r.message)
+            else -> {}
+        }
+    }
+
+    fun searchUsers(query: String) = viewModelScope.launch {
+        if (query.length < 2) { _searchResults.value = emptyList(); return@launch }
+        when (val r = userRepo.searchUsers(query)) {
+            is Result.Success -> _searchResults.value = r.data
+            else -> {}
+        }
+    }
+
+    fun acceptRequest(id: String) = viewModelScope.launch {
+        when (friendRepo.acceptRequest(id)) {
+            is Result.Success -> { loadRequests(); loadFriends() }
+            is Result.Error -> _event.emit("Failed to accept request")
+            else -> {}
+        }
+    }
+
+    fun declineRequest(id: String) = viewModelScope.launch {
+        friendRepo.declineRequest(id)
+        loadRequests()
+    }
+
+    fun sendFriendRequest(toUserId: String) = viewModelScope.launch {
+        when (friendRepo.sendFriendRequest(toUserId)) {
+            is Result.Success -> _event.emit("Friend request sent!")
+            is Result.Error -> _event.emit("Failed to send request")
+            else -> {}
+        }
+    }
+
+    fun unfriend(friendshipId: String) = viewModelScope.launch {
+        friendRepo.unfriend(friendshipId)
+        loadFriends()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  FriendshipActivity
+// ────────────────────────────────────────────────────────────────────
+@AndroidEntryPoint
+class FriendshipActivity : AppCompatActivity() {
+
+    private lateinit var binding: ActivityFriendshipBinding
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityFriendshipBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        val tabs = listOf("Friends", "Requests", "Search")
+        binding.viewPager.adapter = object : FragmentStateAdapter(this) {
+            override fun getItemCount() = 3
+            override fun createFragment(position: Int): Fragment = when (position) {
+                0 -> FriendsTabFragment()
+                1 -> RequestsTabFragment()
+                else -> SearchTabFragment()
+            }
+        }
+        TabLayoutMediator(binding.tabLayout, binding.viewPager) { tab, pos -> tab.text = tabs[pos] }.attach()
+        binding.btnBack.setOnClickListener { finish() }
+
+        // Open to requested tab if coming from notification
+        val startTab = intent.getIntExtra(Constants.EXTRA_FRIENDSHIP_TAB, 0)
+        binding.viewPager.setCurrentItem(startTab, false)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  FriendsTabFragment
+// ────────────────────────────────────────────────────────────────────
+@AndroidEntryPoint
+class FriendsTabFragment : Fragment() {
+    private var _binding: FragmentFriendsTabBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: FriendshipViewModel by viewModels({ requireActivity() })
+
+    override fun onCreateView(i: LayoutInflater, c: ViewGroup?, s: Bundle?) =
+        FragmentFriendsTabBinding.inflate(i, c, false).also { _binding = it }.root
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        val adapter = FriendAdapter(
+            onTap = { friendship ->
+                startActivity(android.content.Intent(requireContext(), FriendProfileActivity::class.java)
+                    .putExtra(Constants.EXTRA_FRIEND_ID, friendship.friend.id))
+            },
+            onUnfriend = { friendship -> viewModel.unfriend(friendship.id) }
+        )
+        binding.rvFriends.layoutManager = LinearLayoutManager(requireContext())
+        binding.rvFriends.adapter = adapter
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.friends.collect { list ->
+                adapter.submitList(list)
+                binding.emptyState.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
+            }
+        }
+        viewModel.loadFriends()
+    }
+
+    override fun onDestroyView() { super.onDestroyView(); _binding = null }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  RequestsTabFragment

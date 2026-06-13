@@ -13,7 +13,11 @@ app.config_from_object("django.conf:settings", namespace="CELERY")
 # Auto-discover tasks in all installed apps
 app.autodiscover_tasks()
 
+# Explicitly import services.translation to register tasks in non-app modules
+import services.translation  # noqa: F401
+
 
 @app.task(bind=True, ignore_result=True)
 def debug_task(self):
     print(f"Request: {self.request!r}")
+

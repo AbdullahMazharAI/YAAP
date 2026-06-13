@@ -1,0 +1,800 @@
+
+
+# ─── Patch PresenceConsumer at import time ────────────────────────────────────
+from channels_consumers.presence_consumer import PresenceConsumer  # noqa: E402
+
+PresenceConsumer.voice_training_update = voice_training_update  # type: ignore
+# ===== d:/yaap1/YAAP\backend\channels_consumers\__init__.py =====
+# WebSocket consumers package
+# ===== d:/yaap1/YAAP\backend\microservices\whisper_service.py =====
+"""
+Whisper STT Microservice
+FastAPI server wrapping OpenAI Whisper large-v3 for:
+  POST /transcribe  — transcribe audio to text
+  GET  /health      — health check
+  GET  /languages   — supported language list
+
+Run with:
+  pip install fastapi uvicorn openai-whisper ffmpeg-python torch
+  uvicorn whisper_service:app --host 0.0.0.0 --port 8002 --workers 1
+
+Notes:
+  - Whisper large-v3 requires ~3 GB GPU VRAM or ~6 GB RAM on CPU
+  - For real-time calls, use whisper.cpp with small/medium model for < 500 ms latency
+  - Set MODEL_SIZE env var: tiny/base/small/medium/large-v3 (default: large-v3)
+"""
+
+import io
+import logging
+import os
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
+
+import uvicorn
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+logger     = logging.getLogger("whisper_service")
+logging.basicConfig(level=logging.INFO)
+
+app        = FastAPI(title="YAAP Whisper STT Service", version="1.0.0")
+_model     = None
+MODEL_SIZE = os.environ.get("WHISPER_MODEL", "large-v3")
+
+
+# ─── Supported Languages ──────────────────────────────────────────────────────
+
+WHISPER_LANGUAGES = {
+    "en": "english",   "es": "spanish",    "fr": "french",
+    "de": "german",    "it": "italian",    "pt": "portuguese",
+    "pl": "polish",    "tr": "turkish",    "ru": "russian",
+    "nl": "dutch",     "cs": "czech",      "ar": "arabic",
+    "zh": "chinese",   "ja": "japanese",   "ko": "korean",
+    "hu": "hungarian", "hi": "hindi",
+}
+
+
+# ─── Model Loading ────────────────────────────────────────────────────────────
+
+def _get_model():
+    global _model
+    if _model is None:
+        import whisper
+        logger.info("Loading Whisper %s model...", MODEL_SIZE)
+        t0     = time.time()
+        _model = whisper.load_model(MODEL_SIZE)
+        logger.info("Whisper %s loaded in %.1fs", MODEL_SIZE, time.time() - t0)
+    return _model
+
+
+# ─── Response Models ──────────────────────────────────────────────────────────
+
+class TranscriptSegment(BaseModel):
+    start: float
+    end:   float
+    text:  str
+
+
+class TranscribeResponse(BaseModel):
+    text:     str
+    language: str
+    duration: float
+    segments: list[TranscriptSegment]
+    model:    str
+    took_ms:  float
+
+
+class HealthResponse(BaseModel):
+    status: str
+    model:  str
+    device: str
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return HealthResponse(status="ok", model=MODEL_SIZE, device=device)
+
+
+@app.get("/languages")
+async def languages():
+    return {"languages": list(WHISPER_LANGUAGES.keys())}
+
+
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe(
+    audio_file: UploadFile = File(...),
+    language:   Optional[str] = Query(None, description="ISO language code hint (e.g. 'ar'). None = auto-detect."),
+    task:       str            = Query("transcribe", description="'transcribe' or 'translate' (translate → English)"),
+):
+    """
+    Transcribe an audio file using Whisper.
+    Accepts WAV, MP3, OGG, M4A, WebM.
+    Returns full transcript, detected language, duration, and word segments.
+    """
+    if task not in ("transcribe", "translate"):
+        raise HTTPException(400, "task must be 'transcribe' or 'translate'.")
+
+    content = await audio_file.read()
+    if not content:
+        raise HTTPException(400, "Audio file is empty.")
+    if len(content) > 100 * 1024 * 1024:    # 100 MB hard limit
+        raise HTTPException(413, "Audio file too large (max 100 MB).")
+
+    t0    = time.time()
+    model = _get_model()
+
+    # Write to temp file (Whisper needs a file path for ffmpeg decoding)
+    suffix = Path(audio_file.filename or "audio.wav").suffix or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        whisper_lang = None
+        if language:
+            whisper_lang = WHISPER_LANGUAGES.get(language, language)
+
+        result = model.transcribe(
+            tmp_path,
+            language           = whisper_lang,
+            task               = task,
+            word_timestamps    = False,
+            verbose            = False,
+            condition_on_previous_text = True,
+            temperature        = 0.0,   # greedy decoding for consistency
+            compression_ratio_threshold = 2.4,
+            no_speech_threshold = 0.6,
+        )
+
+        took_ms  = (time.time() - t0) * 1000
+        detected = result.get("language", language or "unknown")
+
+        segments = [
+            TranscriptSegment(
+                start = seg["start"],
+                end   = seg["end"],
+                text  = seg["text"].strip(),
+            )
+            for seg in result.get("segments", [])
+        ]
+
+        transcript = result.get("text", "").strip()
+
+        logger.info(
+            "Transcribed: lang=%s chars=%d segments=%d took=%.0fms",
+            detected, len(transcript), len(segments), took_ms,
+        )
+
+        return TranscribeResponse(
+            text     = transcript,
+            language = detected,
+            duration = result.get("segments", [{}])[-1].get("end", 0) if result.get("segments") else 0,
+            segments = segments,
+            model    = MODEL_SIZE,
+            took_ms  = took_ms,
+        )
+
+    except Exception as e:
+        logger.exception("Transcription failed: %s", e)
+        raise HTTPException(500, f"Transcription failed: {e}")
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+# ─── Batch endpoint (for voice training validation) ───────────────────────────
+
+@app.post("/batch-transcribe")
+async def batch_transcribe(
+    audio_files: list[UploadFile] = File(...),
+    language:    Optional[str]    = Query(None),
+):
+    """
+    Transcribe multiple audio files (used during voice training to validate
+    that the user is actually speaking the correct language).
+    Returns list of transcripts in the same order as input files.
+    """
+    results = []
+    for f in audio_files:
+        content = await f.read()
+        suffix  = Path(f.filename or "audio.wav").suffix or ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            model  = _get_model()
+            result = model.transcribe(tmp_path, language=language, task="transcribe", temperature=0.0)
+            results.append({
+                "filename": f.filename,
+                "text":     result.get("text", "").strip(),
+                "language": result.get("language", "unknown"),
+            })
+        except Exception as e:
+            results.append({"filename": f.filename, "error": str(e)})
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    return {"results": results}
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logger.info("Pre-warming Whisper %s model...", MODEL_SIZE)
+    _get_model()
+    logger.info("Whisper service ready.")
+
+    uvicorn.run(
+        "whisper_service:app",
+        host      = "0.0.0.0",
+        port      = int(os.environ.get("PORT", 8002)),
+        workers   = 1,
+        log_level = "info",
+    )
+# ===== d:/yaap1/YAAP\backend\microservices\xtts_service.py =====
+"""
+XTTS Inference Microservice
+FastAPI server that wraps Coqui XTTS v2 for:
+  POST /embed      — compute 256-dim speaker embedding from WAV files
+  POST /synthesize — synthesize speech from text + embedding
+  GET  /health     — health check
+  GET  /languages  — list supported languages
+
+Run with:
+  pip install fastapi uvicorn "coqui-tts>=0.22.0" torch torchaudio
+  uvicorn xtts_service:app --host 0.0.0.0 --port 8001 --workers 1
+
+GPU: set CUDA_VISIBLE_DEVICES=0 before starting for GPU inference.
+CPU: works but synthesis takes 3-8 seconds per utterance.
+
+Docker:
+  FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+  (see xtts_service.Dockerfile)
+"""
+
+import logging
+import os
+import tempfile
+import time
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+
+import torch
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+logger = logging.getLogger("xtts_service")
+logging.basicConfig(level=logging.INFO)
+
+app        = FastAPI(title="YAAP XTTS Service", version="1.0.0")
+_tts_model = None    # lazy-loaded singleton
+
+
+# ─── Supported languages (Coqui XTTS v2) ─────────────────────────────────────
+
+SUPPORTED_LANGUAGES = [
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr",
+    "ru", "nl", "cs", "ar", "zh-cn", "ja", "ko", "hu", "hi",
+]
+
+XTTS_LANG_MAP = {
+    "en": "en", "es": "es", "fr": "fr",  "de": "de",
+    "it": "it", "pt": "pt", "pl": "pl",  "tr": "tr",
+    "ru": "ru", "nl": "nl", "cs": "cs",  "ar": "ar",
+    "zh": "zh-cn", "ja": "ja", "ko": "ko", "hu": "hu", "hi": "hi",
+}
+
+
+# ─── Model Loading ────────────────────────────────────────────────────────────
+
+def _get_model():
+    global _tts_model
+    if _tts_model is None:
+        logger.info("Loading Coqui XTTS v2 model...")
+        t0 = time.time()
+        from TTS.api import TTS
+        _tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+        if torch.cuda.is_available():
+            _tts_model = _tts_model.to("cuda")
+            logger.info("XTTS loaded on GPU in %.1fs", time.time() - t0)
+        else:
+            logger.info("XTTS loaded on CPU in %.1fs (GPU not available)", time.time() - t0)
+    return _tts_model
+
+
+# ─── API Models ───────────────────────────────────────────────────────────────
+
+class SynthesizeRequest(BaseModel):
+    text:      str
+    embedding: list[float]
+    language:  str
+    speed:     float = 1.0
+
+
+class EmbedResponse(BaseModel):
+    embedding:   list[float]
+    dim:         int
+    num_samples: int
+    duration_ms: float
+
+
+class HealthResponse(BaseModel):
+    status:    str
+    model:     str
+    device:    str
+    gpu_mem:   Optional[str]
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    gpu_mem = None
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved  = torch.cuda.memory_reserved()  / 1024 ** 3
+        gpu_mem   = f"{allocated:.2f}GB allocated / {reserved:.2f}GB reserved"
+    return HealthResponse(
+        status  = "ok",
+        model   = "xtts_v2",
+        device  = device,
+        gpu_mem = gpu_mem,
+    )
+
+
+@app.get("/languages")
+async def languages():
+    return {"languages": SUPPORTED_LANGUAGES}
+
+
+@app.post("/embed", response_model=EmbedResponse)
+async def embed(wav_files: list[UploadFile] = File(...)):
+    """
+    Compute a speaker embedding from one or more WAV files.
+    Returns a 256-dimensional float vector representing the speaker's voice.
+    The more samples provided (up to 5), the more robust the embedding.
+    """
+    if not wav_files:
+        raise HTTPException(400, "At least one WAV file is required.")
+
+    t0      = time.time()
+    model   = _get_model()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = []
+        for i, f in enumerate(wav_files):
+            content = await f.read()
+            dest    = os.path.join(tmpdir, f"sample_{i}.wav")
+            Path(dest).write_bytes(content)
+            paths.append(dest)
+
+        try:
+            # XTTS get_conditioning_latents computes the speaker embedding
+            gpt_cond_latent, speaker_embedding = model.synthesizer.tts_model.get_conditioning_latents(
+                audio_path = paths,
+            )
+            # Flatten to a 1D list for JSON serialization
+            embedding = speaker_embedding.squeeze().cpu().tolist()
+            # Ensure it's 1D
+            if isinstance(embedding[0], list):
+                embedding = [x for row in embedding for x in row]
+
+            duration_ms = (time.time() - t0) * 1000
+            logger.info(
+                "Embedding computed: dim=%d samples=%d took=%.0fms",
+                len(embedding), len(paths), duration_ms,
+            )
+            return EmbedResponse(
+                embedding   = embedding,
+                dim         = len(embedding),
+                num_samples = len(paths),
+                duration_ms = duration_ms,
+            )
+        except Exception as e:
+            logger.exception("Embedding computation failed: %s", e)
+            raise HTTPException(500, f"Embedding failed: {e}")
+
+
+@app.post("/synthesize")
+async def synthesize(req: SynthesizeRequest):
+    """
+    Synthesize speech from text using a pre-computed speaker embedding.
+    Returns raw WAV bytes (16 kHz mono 16-bit PCM).
+    """
+    if not req.text or not req.text.strip():
+        raise HTTPException(400, "text must not be empty.")
+
+    lang = XTTS_LANG_MAP.get(req.language, req.language)
+    if lang not in SUPPORTED_LANGUAGES:
+        raise HTTPException(400, f"Unsupported language: {req.language}. Supported: {SUPPORTED_LANGUAGES}")
+
+    if not req.embedding:
+        raise HTTPException(400, "embedding must not be empty.")
+
+    t0    = time.time()
+    model = _get_model()
+
+    try:
+        import numpy as np
+
+        # Reconstruct speaker embedding tensor
+        emb_tensor = torch.tensor(req.embedding, dtype=torch.float32)
+
+        # Infer shape: XTTS expects (1, 512) or (1, 256) depending on model version
+        expected_dim = model.synthesizer.tts_model.embedded_speakers_d
+        if emb_tensor.numel() != expected_dim:
+            logger.warning(
+                "Embedding dim mismatch: got %d expected %d — attempting reshape",
+                emb_tensor.numel(), expected_dim,
+            )
+        emb_tensor = emb_tensor.unsqueeze(0)   # add batch dim → (1, dim)
+
+        if torch.cuda.is_available():
+            emb_tensor = emb_tensor.cuda()
+
+        # Synthesize
+        with torch.no_grad():
+            wav = model.synthesizer.tts_model.inference(
+                text             = req.text,
+                language         = lang,
+                gpt_cond_latent  = None,
+                speaker_embedding = emb_tensor,
+                speed            = req.speed,
+            )
+
+        # Convert to numpy and then WAV bytes
+        wav_np = np.array(wav["wav"], dtype=np.float32)
+
+        # Normalize to int16
+        wav_int16 = (wav_np * 32767).clip(-32768, 32767).astype(np.int16)
+
+        # Encode as WAV
+        buf = BytesIO()
+        import wave
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(24000)    # XTTS outputs at 24 kHz
+            wf.writeframes(wav_int16.tobytes())
+        wav_bytes = buf.getvalue()
+
+        duration_ms = (time.time() - t0) * 1000
+        logger.info(
+            "Synthesis complete: lang=%s chars=%d size=%d bytes took=%.0fms",
+            lang, len(req.text), len(wav_bytes), duration_ms,
+        )
+
+        return Response(
+            content      = wav_bytes,
+            media_type   = "audio/wav",
+            headers      = {
+                "X-Duration-Ms":  str(int(duration_ms)),
+                "X-Sample-Rate":  "24000",
+                "X-Text-Length":  str(len(req.text)),
+            },
+        )
+
+    except Exception as e:
+        logger.exception("Synthesis failed: %s", e)
+        raise HTTPException(500, f"Synthesis failed: {e}")
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Pre-warm the model on startup
+    logger.info("Pre-warming XTTS model...")
+    _get_model()
+    logger.info("XTTS service ready.")
+
+    uvicorn.run(
+        "xtts_service:app",
+        host     = "0.0.0.0",
+        port     = int(os.environ.get("PORT", 8001)),
+        workers  = 1,       # XTTS is NOT thread-safe — single worker only
+        log_level = "info",
+    )
+# ===== d:/yaap1/YAAP\backend\microservices\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\services\audio_processing.py =====
+"""
+Audio Processing Utilities
+Used by the voice training Celery task to prepare WAV files
+before sending to the XTTS embedding service.
+
+Pipeline per sample:
+  1. Decode WAV / convert to 16 kHz mono PCM
+  2. Measure noise floor (reject if too loud)
+  3. Apply Silero VAD to trim leading/trailing silence
+  4. Peak-normalize to –3 dBFS
+  5. Re-encode as WAV 16 kHz mono 16-bit PCM
+
+All processing is done in-memory where possible.
+Writes temp files to /tmp only when required by external tools.
+"""
+
+import logging
+import os
+import struct
+import tempfile
+import wave
+from io import BytesIO
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+TARGET_SAMPLE_RATE    = 16_000   # Hz — required by XTTS
+TARGET_CHANNELS       = 1        # mono
+TARGET_SAMPLE_WIDTH   = 2        # 16-bit
+MIN_DURATION_SECS     = 3.0
+MAX_DURATION_SECS     = 30.0
+NOISE_FLOOR_THRESHOLD = -40.0    # dBFS — warn if ambient noise louder than this
+PEAK_TARGET_DBFS      = -3.0     # normalize to this peak level
+
+
+# ─── Public API ───────────────────────────────────────────────────────────────
+
+def validate_and_process_wav(raw_bytes: bytes, filename: str = "audio.wav") -> dict:
+    """
+    Full validation + processing pipeline.
+
+    Returns:
+        {
+            "ok":              bool,
+            "error":           str | None,     # human-readable error if not ok
+            "processed_bytes": bytes | None,   # processed WAV bytes
+            "duration":        float,          # seconds
+            "noise_floor_db":  float,
+            "sample_rate":     int,
+        }
+    """
+    result = {
+        "ok":              False,
+        "error":           None,
+        "processed_bytes": None,
+        "duration":        0.0,
+        "noise_floor_db":  0.0,
+        "sample_rate":     TARGET_SAMPLE_RATE,
+    }
+
+    # ── 1. Convert to standard format ─────────────────────────────────────────
+    try:
+        pcm_bytes, sample_rate = _to_16khz_mono_pcm(raw_bytes, filename)
+    except Exception as e:
+        result["error"] = f"Could not decode audio file: {e}"
+        return result
+
+    # ── 2. Duration check ─────────────────────────────────────────────────────
+    num_samples = len(pcm_bytes) // TARGET_SAMPLE_WIDTH
+    duration    = num_samples / TARGET_SAMPLE_RATE
+    result["duration"]    = duration
+    result["sample_rate"] = TARGET_SAMPLE_RATE
+
+    if duration < MIN_DURATION_SECS:
+        result["error"] = f"Recording too short ({duration:.1f}s). Minimum is {MIN_DURATION_SECS}s."
+        return result
+    if duration > MAX_DURATION_SECS:
+        result["error"] = f"Recording too long ({duration:.1f}s). Maximum is {MAX_DURATION_SECS}s."
+        return result
+
+    # ── 3. Noise floor measurement ────────────────────────────────────────────
+    noise_floor = _measure_noise_floor(pcm_bytes)
+    result["noise_floor_db"] = noise_floor
+    if noise_floor > NOISE_FLOOR_THRESHOLD:
+        logger.warning(
+            "High ambient noise floor: %.1f dBFS (threshold %.1f)",
+            noise_floor, NOISE_FLOOR_THRESHOLD,
+        )
+        # Warn but do not reject — user is warned in the UI
+
+    # ── 4. VAD trimming ───────────────────────────────────────────────────────
+    try:
+        pcm_bytes = _apply_vad(pcm_bytes)
+        # Recompute duration after VAD
+        duration  = len(pcm_bytes) / TARGET_SAMPLE_WIDTH / TARGET_SAMPLE_RATE
+        result["duration"] = duration
+        if duration < MIN_DURATION_SECS:
+            result["error"] = "Too much silence detected. Please speak clearly and try again."
+            return result
+    except Exception as e:
+        logger.warning("VAD trimming failed (continuing without trim): %s", e)
+
+    # ── 5. Peak normalization ─────────────────────────────────────────────────
+    try:
+        pcm_bytes = _peak_normalize(pcm_bytes)
+    except Exception as e:
+        logger.warning("Peak normalization failed (continuing): %s", e)
+
+    # ── 6. Re-encode as standard WAV ──────────────────────────────────────────
+    result["processed_bytes"] = _encode_wav(pcm_bytes)
+    result["ok"]              = True
+    return result
+
+
+def get_wav_duration(wav_bytes: bytes) -> float:
+    """Quick duration check without full processing."""
+    try:
+        buf = BytesIO(wav_bytes)
+        with wave.open(buf, "rb") as wf:
+            return wf.getnframes() / wf.getframerate()
+    except Exception:
+        return 0.0
+
+
+# ─── Internal Helpers ─────────────────────────────────────────────────────────
+
+def _to_16khz_mono_pcm(raw_bytes: bytes, filename: str) -> tuple[bytes, int]:
+    """
+    Convert any audio format to 16 kHz mono 16-bit PCM using pydub (ffmpeg backend).
+    Falls back to raw wave reading if the input is already a valid WAV.
+    """
+    try:
+        from pydub import AudioSegment
+
+        # Determine format from filename extension
+        ext = Path(filename).suffix.lower().lstrip(".") or "wav"
+        audio = AudioSegment.from_file(BytesIO(raw_bytes), format=ext)
+
+        # Convert to target spec
+        audio = (
+            audio
+            .set_frame_rate(TARGET_SAMPLE_RATE)
+            .set_channels(TARGET_CHANNELS)
+            .set_sample_width(TARGET_SAMPLE_WIDTH)
+        )
+        pcm = audio.raw_data
+        return pcm, TARGET_SAMPLE_RATE
+
+    except ImportError:
+        # pydub/ffmpeg not available — try raw wave parse
+        logger.warning("pydub not available; attempting raw WAV parse")
+        buf = BytesIO(raw_bytes)
+        with wave.open(buf, "rb") as wf:
+            sr = wf.getframerate()
+            pcm = wf.readframes(wf.getnframes())
+            return pcm, sr
+
+
+def _measure_noise_floor(pcm_bytes: bytes) -> float:
+    """
+    Return the RMS level of the quietest 500 ms window in dBFS.
+    This estimates the ambient noise floor.
+    """
+    import math
+    window_size = TARGET_SAMPLE_RATE // 2  # 500 ms in samples
+    samples     = [
+        struct.unpack_from("<h", pcm_bytes, i)[0]
+        for i in range(0, len(pcm_bytes) - 1, TARGET_SAMPLE_WIDTH)
+    ]
+
+    if len(samples) < window_size:
+        return _rms_dbfs(samples)
+
+    min_rms = float("inf")
+    for start in range(0, len(samples) - window_size, window_size):
+        window  = samples[start:start + window_size]
+        rms     = _rms_dbfs(window)
+        if rms < min_rms:
+            min_rms = rms
+
+    return min_rms if min_rms != float("inf") else -96.0
+
+
+def _rms_dbfs(samples: list[int]) -> float:
+    import math
+    if not samples:
+        return -96.0
+    rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+    if rms == 0:
+        return -96.0
+    return 20 * math.log10(rms / 32768.0)
+
+
+def _apply_vad(pcm_bytes: bytes) -> bytes:
+    """
+    Apply Silero VAD to remove leading/trailing silence.
+    Requires: torch, torchaudio (installed with XTTS dependencies).
+    Falls back to a simple energy-based trimmer if torch is unavailable.
+    """
+    try:
+        import torch
+        import torchaudio
+
+        # Convert PCM bytes to float tensor
+        pcm_np = _pcm_bytes_to_float_tensor(pcm_bytes)
+
+        # Load Silero VAD (cached after first load)
+        model, utils = torch.hub.load(
+            repo_or_dir = "snakers4/silero-vad",
+            model       = "silero_vad",
+            force_reload = False,
+            trust_repo  = True,
+        )
+        get_speech_timestamps = utils[0]
+
+        timestamps = get_speech_timestamps(
+            pcm_np,
+            model,
+            sampling_rate    = TARGET_SAMPLE_RATE,
+            min_speech_duration_ms = 250,
+            min_silence_duration_ms = 100,
+        )
+
+        if not timestamps:
+            logger.warning("VAD found no speech segments")
+            return pcm_bytes
+
+        # Trim to speech region [first_start : last_end]
+        start_sample = timestamps[0]["start"]
+        end_sample   = timestamps[-1]["end"]
+        trimmed      = pcm_np[start_sample:end_sample]
+
+        return _float_tensor_to_pcm_bytes(trimmed)
+
+    except Exception as e:
+        logger.warning("Silero VAD failed, using energy-based trimmer: %s", e)
+        return _energy_trim(pcm_bytes)
+
+
+def _energy_trim(pcm_bytes: bytes, threshold_dbfs: float = -50.0) -> bytes:
+    """
+    Simple energy-based silence trimmer — fallback when torch is unavailable.
+    Removes frames below threshold from start and end.
+    """
+    frame_size = TARGET_SAMPLE_RATE // 100  # 10 ms frames
+    samples    = [
+        struct.unpack_from("<h", pcm_bytes, i)[0]
+        for i in range(0, len(pcm_bytes) - 1, TARGET_SAMPLE_WIDTH)
+    ]
+    frames  = [samples[i:i + frame_size] for i in range(0, len(samples), frame_size)]
+    is_loud = [_rms_dbfs(f) > threshold_dbfs for f in frames]
+
+    if not any(is_loud):
+        return pcm_bytes
+
+    first = next(i for i, v in enumerate(is_loud) if v)
+    last  = len(is_loud) - next(i for i, v in enumerate(reversed(is_loud)) if v)
+
+    trimmed_samples = []
+    for frame in frames[first:last]:
+        trimmed_samples.extend(frame)
+
+    return struct.pack(f"<{len(trimmed_samples)}h", *trimmed_samples)
+
+
+def _peak_normalize(pcm_bytes: bytes, target_dbfs: float = PEAK_TARGET_DBFS) -> bytes:
+    """Scale PCM so peak amplitude equals target_dbfs."""
+    import math
+    samples  = [struct.unpack_from("<h", pcm_bytes, i)[0] for i in range(0, len(pcm_bytes) - 1, TARGET_SAMPLE_WIDTH)]
+    peak     = max(abs(s) for s in samples) if samples else 0
+    if peak == 0:
+        return pcm_bytes
+    target_peak = int(32767 * (10 ** (target_dbfs / 20)))
+    scale       = target_peak / peak
+    normalized  = [max(-32768, min(32767, int(s * scale))) for s in samples]
+    return struct.pack(f"<{len(normalized)}h", *normalized)
+
+
+def _encode_wav(pcm_bytes: bytes) -> bytes:
+    """Wrap raw PCM bytes in a WAV container."""
+    buf = BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(TARGET_CHANNELS)
+        wf.setsampwidth(TARGET_SAMPLE_WIDTH)
+        wf.setframerate(TARGET_SAMPLE_RATE)
+        wf.writeframes(pcm_bytes)

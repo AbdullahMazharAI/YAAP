@@ -1,0 +1,800 @@
+        mock_response.status_code = 500
+        mock_response.raise_for_status.side_effect = Exception("500 error")
+        mock_post.return_value    = mock_response
+
+        wav_path = tmp_path / "sample.wav"
+        wav_path.write_bytes(make_wav(make_pcm(4.0)))
+
+        from services.xtts_client import compute_speaker_embedding
+        result = compute_speaker_embedding([str(wav_path)])
+        assert result is None
+
+    def test_compute_embedding_empty_paths(self):
+        from services.xtts_client import compute_speaker_embedding
+        result = compute_speaker_embedding([])
+        assert result is None
+
+    @patch("httpx.post")
+    def test_synthesize_speech_success(self, mock_post):
+        mock_response           = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content   = make_wav(make_pcm(0.5))
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value  = mock_response
+
+        from services.xtts_client import synthesize_speech
+        result = synthesize_speech("Hello", [0.1] * 256, "en")
+        assert isinstance(result, bytes)
+
+    @patch("httpx.get")
+    def test_health_check_ok(self, mock_get):
+        mock_get.return_value.status_code = 200
+        from services.xtts_client import is_xtts_service_healthy
+        assert is_xtts_service_healthy() is True
+
+    @patch("httpx.get")
+    def test_health_check_fail(self, mock_get):
+        mock_get.side_effect = Exception("Connection refused")
+        from services.xtts_client import is_xtts_service_healthy
+        assert is_xtts_service_healthy() is False
+
+
+# ─── Whisper Client ───────────────────────────────────────────────────────────
+
+class TestWhisperClient:
+
+    @patch("httpx.post")
+    def test_transcribe_success(self, mock_post):
+        mock_response             = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "text": "Hello world", "language": "en",
+            "duration": 1.0, "segments": [],
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value    = mock_response
+
+        from services.whisper_service import transcribe
+        result = transcribe(make_wav(make_pcm(1.0)), language="en")
+        assert result is not None
+        assert result["text"] == "Hello world"
+        assert result["language"] == "en"
+
+    @patch("httpx.post")
+    def test_transcribe_returns_none_on_timeout(self, mock_post):
+        import httpx
+        mock_post.side_effect = httpx.TimeoutException("timeout")
+        from services.whisper_service import transcribe
+        result = transcribe(make_wav(make_pcm(1.0)))
+        assert result is None
+
+    @patch("httpx.get")
+    def test_health_check(self, mock_get):
+        mock_get.return_value.status_code = 200
+        from services.whisper_service import is_whisper_service_healthy
+        assert is_whisper_service_healthy() is True
+
+
+# ─── Translation Service ──────────────────────────────────────────────────────
+
+class TestTranslationService:
+
+    @patch("deepl.Translator")
+    def test_deepl_translate_success(self, mock_translator_class):
+        mock_result      = MagicMock()
+        mock_result.text = "Bonjour le monde"
+        mock_translator  = MagicMock()
+        mock_translator.translate_text.return_value = mock_result
+        mock_translator_class.return_value          = mock_translator
+
+        from services.translation import _try_deepl
+        with patch("django.conf.settings") as mock_settings:
+            mock_settings.DEEPL_API_KEY  = "test-key"
+            result = _try_deepl("Hello world", "fr", "en")
+        # Result depends on deepl mock setup — just check it calls through
+        # (actual assertion on mock_translator.translate_text)
+        mock_translator.translate_text.assert_called()
+
+    def test_cache_key_consistent(self):
+        from services.translation import _cache_key
+        key1 = _cache_key("Hello world", "ar")
+        key2 = _cache_key("Hello world", "ar")
+        assert key1 == key2
+
+    def test_cache_key_different_for_different_inputs(self):
+        from services.translation import _cache_key
+        key1 = _cache_key("Hello", "ar")
+        key2 = _cache_key("Hello", "fr")
+        assert key1 != key2
+
+    @patch("django.core.cache.cache.get")
+    @patch("django.core.cache.cache.set")
+    @patch("services.translation._try_deepl")
+    def test_translate_uses_cache(self, mock_deepl, mock_cache_set, mock_cache_get):
+        mock_cache_get.return_value = "cached translation"
+        from services.translation import translate
+        result = translate("Hello", "ar", "en")
+        assert result == "cached translation"
+        mock_deepl.assert_not_called()   # DeepL not called — cache hit
+
+    @patch("django.core.cache.cache.get")
+    @patch("django.core.cache.cache.set")
+    @patch("services.translation._try_deepl")
+    @patch("services.translation._try_helsinki")
+    def test_translate_falls_back_to_helsinki(self, mock_helsinki, mock_deepl, mock_set, mock_get):
+        mock_get.return_value    = None           # cache miss
+        mock_deepl.return_value  = None           # DeepL fails
+        mock_helsinki.return_value = "Translated via Helsinki"
+        from services.translation import translate
+        result = translate("Hello", "hi", "en")   # Hindi — not in DeepL
+        assert result == "Translated via Helsinki"
+
+    @patch("django.core.cache.cache.get")
+    @patch("services.translation._try_deepl")
+    @patch("services.translation._try_helsinki")
+    def test_translate_returns_original_on_total_failure(self, mock_helsinki, mock_deepl, mock_get):
+        mock_get.return_value    = None
+        mock_deepl.return_value  = None
+        mock_helsinki.return_value = None
+        from services.translation import translate
+        result = translate("Hello", "xx", "en")
+        assert result == "Hello"   # original returned on failure
+
+    def test_same_language_returns_original(self):
+        from services.translation import translate
+        result = translate("Hello", "en", "en")
+        assert result == "Hello"
+
+
+# ─── Audio Processing ─────────────────────────────────────────────────────────
+
+class TestAudioProcessing:
+
+    def test_validate_valid_wav(self):
+        from services.audio_processing import validate_and_process_wav
+        pcm    = make_pcm(4.0, amplitude=5000)
+        wav    = make_wav(pcm)
+        result = validate_and_process_wav(wav, "audio.wav")
+        assert result["ok"] is True
+        assert result["duration"] > 0
+        assert result["processed_bytes"] is not None
+
+    def test_reject_too_short(self):
+        from services.audio_processing import validate_and_process_wav
+        pcm    = make_pcm(1.0)    # only 1 second — below 3s minimum
+        wav    = make_wav(pcm)
+        result = validate_and_process_wav(wav, "short.wav")
+        assert result["ok"] is False
+        assert "short" in result["error"].lower()
+
+    def test_reject_too_long(self):
+        from services.audio_processing import validate_and_process_wav
+        pcm    = make_pcm(35.0)   # 35 seconds — above 30s maximum
+        wav    = make_wav(pcm)
+        result = validate_and_process_wav(wav, "long.wav")
+        assert result["ok"] is False
+        assert "long" in result["error"].lower()
+
+    def test_noise_floor_measured(self):
+        from services.audio_processing import validate_and_process_wav
+        pcm    = make_pcm(4.0, amplitude=5000)
+        wav    = make_wav(pcm)
+        result = validate_and_process_wav(wav, "audio.wav")
+        assert result["ok"] is True
+        assert isinstance(result["noise_floor_db"], float)
+        assert result["noise_floor_db"] < 0   # negative dBFS
+
+    def test_peak_normalize(self):
+        from services.audio_processing import _peak_normalize, _rms_dbfs
+        pcm       = make_pcm(1.0, amplitude=1000)   # quiet
+        normalized = _peak_normalize(pcm)
+        samples_orig = [struct.unpack_from("<h", pcm, i)[0] for i in range(0, len(pcm) - 1, 2)]
+        samples_norm = [struct.unpack_from("<h", normalized, i)[0] for i in range(0, len(normalized) - 1, 2)]
+        # Normalized peak should be louder
+        assert max(abs(s) for s in samples_norm) > max(abs(s) for s in samples_orig)
+# ===== d:/yaap1/YAAP\backend\apps\calls\tests\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\friendships\admin.py =====
+from django.contrib import admin
+from .models import FriendRequest, Friendship, Block, UserDevice
+
+
+@admin.register(FriendRequest)
+class FriendRequestAdmin(admin.ModelAdmin):
+    list_display  = ["from_user", "to_user", "status", "created_at", "responded_at"]
+    list_filter   = ["status"]
+    search_fields = ["from_user__email", "to_user__email"]
+    readonly_fields = ["id", "created_at"]
+
+
+@admin.register(Friendship)
+class FriendshipAdmin(admin.ModelAdmin):
+    list_display  = ["user_a", "user_b", "created_at"]
+    search_fields = ["user_a__email", "user_b__email"]
+    readonly_fields = ["id", "created_at"]
+
+
+@admin.register(Block)
+class BlockAdmin(admin.ModelAdmin):
+    list_display  = ["blocker", "blocked", "created_at"]
+    search_fields = ["blocker__email", "blocked__email"]
+    readonly_fields = ["id", "created_at"]
+
+
+@admin.register(UserDevice)
+class UserDeviceAdmin(admin.ModelAdmin):
+    list_display  = ["user", "device_name", "last_used_at"]
+    search_fields = ["user__email"]
+    readonly_fields = ["id", "last_used_at"]
+# ===== d:/yaap1/YAAP\backend\apps\friendships\apps.py =====
+from django.apps import AppConfig
+
+
+class FriendshipsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name               = "apps.friendships"
+    verbose_name       = "Friendships"
+# ===== d:/yaap1/YAAP\backend\apps\friendships\models.py =====
+"""
+Friendships Models
+Covers: FriendRequest, Friendship (accepted), Block.
+
+Design decisions:
+  - Friendship stores user_a < user_b (UUID ordering) to ensure uniqueness
+    without needing a separate unique_together constraint on both orderings.
+  - Managers expose high-level query methods used across the codebase.
+  - FriendRequest enforces a 7-day cooldown before re-sending after a decline.
+"""
+
+import uuid
+from django.conf import settings
+from django.db import models
+from django.utils import timezone
+from datetime import timedelta
+
+
+# ─── Friendship Manager ───────────────────────────────────────────────────────
+
+class FriendshipManager(models.Manager):
+
+    def are_friends(self, user_a, user_b) -> bool:
+        """Check if two users are friends. Order-independent."""
+        a, b = _ordered(user_a, user_b)
+        return self.filter(user_a=a, user_b=b).exists()
+
+    def get_friends(self, user):
+        """Return a queryset of User objects who are friends with `user`."""
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        qs   = self.filter(models.Q(user_a=user) | models.Q(user_b=user))
+        # Collect the other side's IDs
+        friend_ids = []
+        for f in qs.values("user_a_id", "user_b_id"):
+            oid = f["user_b_id"] if f["user_a_id"] == user.id else f["user_a_id"]
+            friend_ids.append(oid)
+        return User.objects.filter(id__in=friend_ids, is_active=True)
+
+    def mutual_friends_count(self, user_a, user_b) -> int:
+        """Count mutual friends between two users."""
+        friends_a = set(self.get_friends(user_a).values_list("id", flat=True))
+        friends_b = set(self.get_friends(user_b).values_list("id", flat=True))
+        return len(friends_a & friends_b)
+
+    def unfriend(self, user_a, user_b) -> bool:
+        """Remove a friendship. Returns True if a record was deleted."""
+        a, b     = _ordered(user_a, user_b)
+        deleted, _ = self.filter(user_a=a, user_b=b).delete()
+        return deleted > 0
+
+
+# ─── FriendRequest Manager ────────────────────────────────────────────────────
+
+class FriendRequestManager(models.Manager):
+
+    def can_send_request(self, from_user, to_user) -> tuple[bool, str]:
+        """
+        Returns (allowed: bool, reason: str).
+        Checks:
+          1. Not already friends
+          2. No pending request in either direction
+          3. Not blocked
+          4. Cooldown period after decline
+        """
+        from apps.friendships.models import Block
+
+        if Friendship.objects.are_friends(from_user, to_user):
+            return False, "You are already friends."
+
+        if Block.objects.is_blocked(from_user, to_user):
+            return False, "Cannot send request."
+
+        # Pending request from me to them
+        if self.filter(from_user=from_user, to_user=to_user, status=FriendRequest.Status.PENDING).exists():
+            return False, "You already sent a friend request to this user."
+
+        # Pending request from them to me (should accept instead)
+        if self.filter(from_user=to_user, to_user=from_user, status=FriendRequest.Status.PENDING).exists():
+            return False, "This user already sent you a friend request. Accept it instead."
+
+        # Cooldown after decline
+        cooldown_cutoff = timezone.now() - timedelta(days=settings.YAAP_FRIEND_REQUEST_COOLDOWN_DAYS)
+        if self.filter(
+            from_user=from_user,
+            to_user=to_user,
+            status=FriendRequest.Status.DECLINED,
+            responded_at__gte=cooldown_cutoff,
+        ).exists():
+            return False, f"You can re-send a request after {settings.YAAP_FRIEND_REQUEST_COOLDOWN_DAYS} days."
+
+        return True, "ok"
+
+
+# ─── Block Manager ────────────────────────────────────────────────────────────
+
+class BlockManager(models.Manager):
+
+    def is_blocked(self, user_a, user_b) -> bool:
+        """Returns True if either user has blocked the other."""
+        return self.filter(
+            models.Q(blocker=user_a, blocked=user_b) |
+            models.Q(blocker=user_b, blocked=user_a)
+        ).exists()
+
+    def blocked_user_ids(self, user) -> list:
+        """Return IDs of all users blocked by OR blocking `user`."""
+        qs = self.filter(models.Q(blocker=user) | models.Q(blocked=user))
+        ids = set()
+        for b in qs.values("blocker_id", "blocked_id"):
+            ids.add(b["blocker_id"])
+            ids.add(b["blocked_id"])
+        ids.discard(user.id)
+        return list(ids)
+
+
+# ─── Models ───────────────────────────────────────────────────────────────────
+
+class FriendRequest(models.Model):
+
+    class Status(models.TextChoices):
+        PENDING   = "pending",   "Pending"
+        ACCEPTED  = "accepted",  "Accepted"
+        DECLINED  = "declined",  "Declined"
+        CANCELLED = "cancelled", "Cancelled"
+
+    id           = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    from_user    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="sent_friend_requests",
+    )
+    to_user      = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="received_friend_requests",
+    )
+    status       = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING, db_index=True)
+    created_at   = models.DateTimeField(auto_now_add=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+    message      = models.CharField(max_length=200, blank=True, default="",
+                                     help_text="Optional short message from requester")
+
+    objects = FriendRequestManager()
+
+    class Meta:
+        db_table = "friend_requests"
+        unique_together = [("from_user", "to_user", "status")]
+        indexes = [
+            models.Index(fields=["to_user", "status"]),
+            models.Index(fields=["from_user", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.from_user} → {self.to_user} [{self.status}]"
+
+    def accept(self):
+        """Accept the request: create Friendship record, mark request accepted."""
+        self.status       = self.Status.ACCEPTED
+        self.responded_at = timezone.now()
+        self.save(update_fields=["status", "responded_at"])
+
+        a, b = _ordered(self.from_user, self.to_user)
+        Friendship.objects.get_or_create(user_a=a, user_b=b)
+
+    def decline(self):
+        self.status       = self.Status.DECLINED
+        self.responded_at = timezone.now()
+        self.save(update_fields=["status", "responded_at"])
+
+    def cancel(self):
+        self.status       = self.Status.CANCELLED
+        self.responded_at = timezone.now()
+        self.save(update_fields=["status", "responded_at"])
+
+
+class Friendship(models.Model):
+    """
+    Represents an accepted, bidirectional friendship.
+    user_a.id < user_b.id (UUID lex order) is enforced in save()
+    to prevent duplicate rows for the same pair.
+    """
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user_a     = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="friendships_as_a",
+    )
+    user_b     = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="friendships_as_b",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = FriendshipManager()
+
+    class Meta:
+        db_table        = "friendships"
+        unique_together = [("user_a", "user_b")]
+        indexes         = [
+            models.Index(fields=["user_a"]),
+            models.Index(fields=["user_b"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        # Enforce user_a < user_b ordering
+        if str(self.user_a_id) > str(self.user_b_id):
+            self.user_a_id, self.user_b_id = self.user_b_id, self.user_a_id
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.user_a} ↔ {self.user_b}"
+
+
+class Block(models.Model):
+    """Directional block: blocker has blocked blocked_user."""
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    blocker    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="blocks_made",
+    )
+    blocked    = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="blocks_received",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = BlockManager()
+
+    class Meta:
+        db_table        = "blocks"
+        unique_together = [("blocker", "blocked")]
+
+    def __str__(self):
+        return f"{self.blocker} blocked {self.blocked}"
+
+
+# ─── Utility ──────────────────────────────────────────────────────────────────
+
+def _ordered(user_a, user_b):
+    """Return (user_a, user_b) with lexicographically smaller UUID first."""
+    a_id = str(user_a.id if hasattr(user_a, "id") else user_a)
+    b_id = str(user_b.id if hasattr(user_b, "id") else user_b)
+    if a_id <= b_id:
+        return user_a, user_b
+    return user_b, user_a
+
+
+class UserDevice(models.Model):
+    """
+    Stores FCM device tokens per user.
+    A user may have multiple devices (phone + tablet).
+    """
+    id           = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user         = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="devices",
+    )
+    fcm_token    = models.TextField(unique=True)
+    device_name  = models.CharField(max_length=100, blank=True, default="")
+    created_at   = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "user_devices"
+        indexes  = [models.Index(fields=["user"])]
+
+    def __str__(self):
+        return f"{self.user} — {self.device_name or 'device'}"
+# ===== d:/yaap1/YAAP\backend\apps\friendships\serializers.py =====
+from django.conf import settings
+from rest_framework import serializers
+
+from apps.accounts.serializers import UserMiniSerializer
+from .models import Block, FriendRequest, Friendship, UserDevice
+
+
+# ─── Friend Request ───────────────────────────────────────────────────────────
+
+class SendFriendRequestSerializer(serializers.Serializer):
+    to_user_id = serializers.UUIDField()
+    message = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
+
+    def validate_to_user_id(self, value):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        requesting_user = self.context["request"].user
+
+        if str(value) == str(requesting_user.id):
+            raise serializers.ValidationError("You cannot send a friend request to yourself.")
+
+        if not User.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError("User not found.")
+
+        return value
+
+    def validate(self, attrs):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        requesting_user = self.context["request"].user
+        to_user = User.objects.get(id=attrs["to_user_id"])
+
+        allowed, reason = FriendRequest.objects.can_send_request(requesting_user, to_user)
+        if not allowed:
+            raise serializers.ValidationError({"to_user_id": reason})
+
+        attrs["to_user"] = to_user
+        return attrs
+
+
+class FriendRequestSerializer(serializers.ModelSerializer):
+    from_user = UserMiniSerializer(read_only=True)
+    to_user = UserMiniSerializer(read_only=True)
+
+    class Meta:
+        model = FriendRequest
+        fields = ["id", "from_user", "to_user", "status", "message", "created_at", "responded_at"]
+        read_only_fields = fields
+
+
+class FriendRequestMiniSerializer(serializers.ModelSerializer):
+    from_user_name = serializers.CharField(source="from_user.name", read_only=True)
+    from_user_avatar = serializers.CharField(source="from_user.avatar_url", read_only=True)
+    from_user_id = serializers.UUIDField(source="from_user.id", read_only=True)
+
+    class Meta:
+        model = FriendRequest
+        fields = ["id", "from_user_id", "from_user_name", "from_user_avatar", "message", "created_at"]
+        read_only_fields = fields
+
+
+# ─── Friendship ───────────────────────────────────────────────────────────────
+
+class FriendSerializer(serializers.ModelSerializer):
+    friend = serializers.SerializerMethodField()
+    friendship_since = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = Friendship
+        fields = ["id", "friend", "friendship_since"]
+
+    def get_friend(self, obj):
+        requesting_user = self.context["request"].user
+        other = obj.user_b if obj.user_a_id == requesting_user.id else obj.user_a
+        return FriendProfileSerializer(other, context=self.context).data
+
+
+class FriendProfileSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    display_name = serializers.CharField(allow_blank=True, allow_null=True, default="")
+    full_name = serializers.CharField(allow_blank=True, allow_null=True, default="")
+    avatar_url = serializers.CharField(allow_blank=True, allow_null=True, default="")
+    country_code = serializers.CharField(allow_blank=True, allow_null=True, default="")
+    timezone = serializers.CharField(allow_blank=True, allow_null=True, default="UTC")
+    language_preference = serializers.CharField(allow_blank=True, allow_null=True, default="en")
+    bio = serializers.CharField(allow_blank=True, allow_null=True, default="")
+    is_online = serializers.SerializerMethodField()
+    last_seen = serializers.SerializerMethodField()
+    local_time = serializers.SerializerMethodField()
+
+    def get_is_online(self, obj):
+        if not getattr(obj, "show_online_status", True):
+            return None
+        return getattr(obj, "is_online", False)
+
+    def get_last_seen(self, obj):
+        from apps.friendships.models import Friendship as F
+        requesting_user = self.context["request"].user
+        vis = getattr(obj, "last_seen_visibility", None)
+        if vis == "nobody":
+            return None
+        if vis == "friends":
+            if not F.objects.are_friends(requesting_user, obj):
+                return None
+        return getattr(obj, "last_seen", None)
+
+    def get_local_time(self, obj):
+        from zoneinfo import ZoneInfo
+        from django.utils import timezone as tz
+
+        try:
+            tz_name = getattr(obj, "timezone", None) or "UTC"
+            local_now = tz.now().astimezone(ZoneInfo(tz_name))
+            return local_now.strftime("%H:%M")
+        except Exception:
+            return None
+
+
+# ─── Block ────────────────────────────────────────────────────────────────────
+
+class BlockSerializer(serializers.ModelSerializer):
+    blocked_user = UserMiniSerializer(source="blocked", read_only=True)
+
+    class Meta:
+        model = Block
+        fields = ["id", "blocked_user", "created_at"]
+        read_only_fields = fields
+
+
+class BlockUserSerializer(serializers.Serializer):
+    user_id = serializers.UUIDField()
+
+    def validate_user_id(self, value):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        requesting_user = self.context["request"].user
+
+        if str(value) == str(requesting_user.id):
+            raise serializers.ValidationError("You cannot block yourself.")
+        if not User.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError("User not found.")
+        if Block.objects.filter(blocker=requesting_user, blocked_id=value).exists():
+            raise serializers.ValidationError("You have already blocked this user.")
+        return value
+
+
+# ─── UserDevice (FCM Token) ───────────────────────────────────────────────────
+
+class RegisterDeviceSerializer(serializers.ModelSerializer):
+    device_name = serializers.CharField(required=False, allow_blank=True, default="")
+    fcm_token = serializers.CharField(required=False, allow_blank=False)
+
+    class Meta:
+        model = UserDevice
+        fields = ["fcm_token", "device_name"]
+
+    def validate(self, attrs):
+        raw = self.initial_data or {}
+
+        if not attrs.get("fcm_token"):
+            attrs["fcm_token"] = (
+                raw.get("fcm_token")
+                or raw.get("token")
+                or raw.get("device_token")
+                or raw.get("registration_token")
+            )
+
+        if not attrs.get("device_name"):
+            attrs["device_name"] = (
+                raw.get("device_name")
+                or raw.get("platform")
+                or raw.get("device")
+                or ""
+            )
+
+        if not attrs.get("fcm_token"):
+            raise serializers.ValidationError({"fcm_token": "FCM token is required."})
+
+        return attrs
+
+    def create(self, validated_data):
+        user = self.context["request"].user
+        device, _ = UserDevice.objects.update_or_create(
+            fcm_token=validated_data["fcm_token"],
+            defaults={
+                "user": user,
+                "device_name": validated_data.get("device_name", ""),
+            },
+        )
+        return device
+# ===== d:/yaap1/YAAP\backend\apps\friendships\urls.py =====
+from django.urls import path
+from .views import (
+    FriendsListView,
+    FriendDetailView,
+    SendFriendRequestView,
+    ReceivedFriendRequestsView,
+    SentFriendRequestsView,
+    AcceptFriendRequestView,
+    DeclineFriendRequestView,
+    CancelFriendRequestView,
+    BlockUserView,
+    UnblockUserView,
+    BlockedUsersView,
+    RegisterDeviceView,
+    FriendSuggestionsView,
+)
+
+# This code block defines the URL patterns for a Django application. Each `path` function call maps a
+# URL pattern to a specific view class. Here's a breakdown of what each URL pattern is doing:
+urlpatterns = [
+    # ─── Friends ────────────────────────────────────────────────────────────
+    path("",                                FriendsListView.as_view(),           name="friends-list"),
+    path("<uuid:friendship_id>/",           FriendDetailView.as_view(),          name="friend-detail"),
+    path("suggestions/",                    FriendSuggestionsView.as_view(),     name="friend-suggestions"),
+
+    # ─── Friend Requests ────────────────────────────────────────────────────
+    path("request/",                        SendFriendRequestView.as_view(),     name="friend-request-send"),
+    path("requests/received/",              ReceivedFriendRequestsView.as_view(), name="friend-requests-received"),
+    path("requests/sent/",                  SentFriendRequestsView.as_view(),    name="friend-requests-sent"),
+    path("requests/<uuid:request_id>/accept/",  AcceptFriendRequestView.as_view(),  name="friend-request-accept"),
+    path("requests/<uuid:request_id>/decline/", DeclineFriendRequestView.as_view(), name="friend-request-decline"),
+    path("requests/<uuid:request_id>/",     CancelFriendRequestView.as_view(),  name="friend-request-cancel"),
+
+    # ─── Block ──────────────────────────────────────────────────────────────
+    path("block/",                          BlockUserView.as_view(),             name="user-block"),
+    path("block/<uuid:user_id>/",           UnblockUserView.as_view(),           name="user-unblock"),
+    path("blocked/",                        BlockedUsersView.as_view(),          name="blocked-list"),
+    # ─── Devices (FCM) ──────────────────────────────────────────────────────
+    path("devices/",                        RegisterDeviceView.as_view(),        name="device-register"),
+]
+# ===== d:/yaap1/YAAP\backend\apps\friendships\views.py =====
+"""
+Friendships Views
+All endpoints for friend requests, friends list, block/unblock, and FCM device registration.
+
+Endpoint map (all under /api/v1/friends/):
+  GET    /                          — list accepted friends
+  DELETE /{friendship_id}/          — unfriend
+
+  POST   /request/                  — send a friend request
+  GET    /requests/received/        — incoming pending requests
+  GET    /requests/sent/            — outgoing pending requests
+  POST   /requests/{id}/accept/     — accept an incoming request
+  POST   /requests/{id}/decline/    — decline an incoming request
+  DELETE /requests/{id}/            — cancel an outgoing request
+
+  POST   /block/                    — block a user
+  DELETE /block/{user_id}/          — unblock a user
+  GET    /blocked/                  — list blocked users
+
+  POST   /devices/                  — register FCM device token
+  DELETE /devices/{token}/          — remove FCM token on logout
+"""
+
+import logging
+
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.db.models import Q
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from services.fcm_service import notify_friend_request
+from .models import Block, FriendRequest, Friendship, UserDevice
+from .serializers import (
+    BlockSerializer,
+    BlockUserSerializer,
+    FriendRequestMiniSerializer,
+    FriendRequestSerializer,
+    FriendSerializer,
+    RegisterDeviceSerializer,
+    SendFriendRequestSerializer,
+)
+
+logger = logging.getLogger(__name__)
+User   = get_user_model()
+
+
+def _ok(data, status_code=status.HTTP_200_OK):
+    return Response({"success": True, "data": data}, status=status_code)
+
+
+def _err(code, message, status_code=status.HTTP_400_BAD_REQUEST):
+    return Response(
+        {"success": False, "error": {"code": code, "message": message}},
+        status=status_code,
+    )
+
+
+# ─── Friends List & Unfriend ──────────────────────────────────────────────────
+
+    
+class FriendsListView(APIView):

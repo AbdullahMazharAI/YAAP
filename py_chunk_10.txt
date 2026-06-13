@@ -1,0 +1,800 @@
+    return buf.getvalue()
+
+
+def _pcm_bytes_to_float_tensor(pcm_bytes: bytes):
+    import torch
+    samples = [struct.unpack_from("<h", pcm_bytes, i)[0] for i in range(0, len(pcm_bytes) - 1, TARGET_SAMPLE_WIDTH)]
+    return torch.tensor(samples, dtype=torch.float32) / 32768.0
+
+
+def _float_tensor_to_pcm_bytes(tensor) -> bytes:
+    samples = (tensor.numpy() * 32768.0).clip(-32768, 32767).astype("int16")
+    return samples.tobytes()
+# ===== d:/yaap1/YAAP\backend\services\email_service.py =====
+"""
+Email Service
+Sends transactional emails (OTP codes, password reset links).
+Uses Supabase's built-in email provider for simplicity.
+Can be swapped for SendGrid/SES by changing the send implementation.
+"""
+
+import logging
+from celery import shared_task
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _send_email(to: str, subject: str, html_body: str) -> bool:
+    """
+    Core send function. In production wire this to:
+      - AWS SES (boto3 ses client)
+      - SendGrid (sendgrid.SendGridAPIClient)
+      - Supabase email (via supabase.auth.admin.invite_user_by_email for invites)
+    For now uses Python's smtplib via Django's email backend.
+    """
+    from django.core.mail import send_mail
+    try:
+        send_mail(
+            subject         = subject,
+            message         = "",          # plain text fallback
+            html_message    = html_body,
+            from_email      = getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@yaap.app"),
+            recipient_list  = [to],
+            fail_silently   = False,
+        )
+        logger.info("Email sent to %s: %s", to, subject)
+        return True
+    except Exception as e:
+        logger.error("Failed to send email to %s: %s", to, e)
+        return False
+
+
+# ─── OTP Email ────────────────────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=10, name="email.send_otp")
+def send_otp_email(self, email: str, code: str):
+    """
+    Celery task — sends a 6-digit OTP to the user's email.
+    Retries up to 3 times on failure with 10s delay.
+    """
+    subject = "Your YAAP login code"
+    html    = f"""
+    <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+      <h2 style="color: #2563EB; margin-bottom: 8px;">YAAP</h2>
+      <p style="color: #374151; font-size: 16px;">
+        Your one-time login code is:
+      </p>
+      <div style="
+        background: #EFF6FF;
+        border: 2px solid #2563EB;
+        border-radius: 12px;
+        padding: 24px;
+        text-align: center;
+        margin: 24px 0;
+      ">
+        <span style="
+          font-size: 48px;
+          font-weight: 800;
+          letter-spacing: 12px;
+          color: #1E3A5F;
+          font-family: monospace;
+        ">{code}</span>
+      </div>
+      <p style="color: #6B7280; font-size: 14px;">
+        This code expires in <strong>{settings.OTP_EXPIRY_MINUTES} minutes</strong>.
+        If you didn't request this, you can safely ignore this email.
+      </p>
+      <hr style="border: none; border-top: 1px solid #E5E7EB; margin: 24px 0;" />
+      <p style="color: #9CA3AF; font-size: 12px;">YAAP — Real-time voice calls, any language.</p>
+    </div>
+    """
+    try:
+        _send_email(email, subject, html)
+    except Exception as exc:
+        logger.error("OTP email failed for %s, retrying. Error: %s", email, exc)
+        raise self.retry(exc=exc)
+
+
+# ─── Password Reset Email ─────────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=10, name="email.send_password_reset")
+def send_password_reset_email(self, email: str):
+    """
+    Triggers a password reset email via Supabase Auth.
+    Supabase generates the secure reset token and hosts the link.
+    """
+    try:
+        from services.supabase_client import get_supabase_admin_client
+        supabase = get_supabase_admin_client()
+        # Supabase sends the reset email natively with its own token
+        supabase.auth.admin.generate_link({
+            "type":       "recovery",
+            "email":      email,
+            "redirect_to": f"{settings.FRONTEND_URL}/reset-password",
+        })
+        logger.info("Password reset link generated for %s", email)
+    except Exception as exc:
+        logger.error("Password reset email failed for %s: %s", email, exc)
+        raise self.retry(exc=exc)
+
+
+# ─── Welcome Email ────────────────────────────────────────────────────────────
+
+@shared_task(name="email.send_welcome")
+def send_welcome_email(email: str, display_name: str):
+    subject = f"Welcome to YAAP, {display_name}!"
+    html    = f"""
+    <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 32px;">
+      <h2 style="color: #2563EB;">Welcome to YAAP, {display_name}! 🎉</h2>
+      <p style="color: #374151; font-size: 16px;">
+        You're all set to start making voice calls across any language barrier.
+      </p>
+      <p style="color: #374151;">
+        Next step: complete your profile and record 5 voice samples so we can
+        clone your voice for real-time translation.
+      </p>
+      <p style="color: #9CA3AF; font-size: 12px; margin-top: 32px;">
+        YAAP — Real-time voice calls, any language.
+      </p>
+    </div>
+    """
+    _send_email(email, subject, html)
+
+
+@shared_task(name="email.cleanup_expired_otps")
+def cleanup_expired_otps():
+    """Periodic task: delete used and expired OTPs older than 24 hours."""
+    from django.utils import timezone
+    from datetime import timedelta
+    from apps.accounts.models import EmailOTP
+    cutoff  = timezone.now() - timedelta(hours=24)
+    deleted, _ = EmailOTP.objects.filter(expires_at__lt=cutoff).delete()
+    return {"deleted": deleted}
+# ===== d:/yaap1/YAAP\backend\services\fcm_service.py =====
+"""
+Firebase Cloud Messaging Service
+Sends push notifications to Android devices for:
+  - Incoming messages (when WebSocket is not connected / app in background)
+  - Incoming call alerts
+  - Friend request notifications
+  - Voice training completion
+"""
+
+import logging
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+_firebase_app = None
+
+
+def _get_firebase_app():
+    """Lazy-initialize Firebase Admin SDK (singleton)."""
+    global _firebase_app
+    if _firebase_app is None:
+        import firebase_admin
+        from firebase_admin import credentials
+        try:
+            cred         = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
+            _firebase_app = firebase_admin.initialize_app(cred)
+            logger.info("Firebase Admin SDK initialized.")
+        except Exception as e:
+            logger.error("Firebase initialization failed: %s", e)
+            raise
+    return _firebase_app
+
+
+def send_push(
+    device_token: str,
+    title: str,
+    body: str,
+    data: dict | None = None,
+    notification_type: str = "message",
+) -> bool:
+    """
+    Send a push notification to a single device.
+
+    Args:
+        device_token:      FCM registration token stored in UserDevice model
+        title:             Notification title
+        body:              Notification body text
+        data:              Extra key-value payload for the app to handle silently
+        notification_type: One of: message | call | friend_request | voice_trained
+
+    Returns:
+        True on success, False on failure.
+    """
+    try:
+        _get_firebase_app()
+        from firebase_admin import messaging
+
+        payload = data or {}
+        payload["type"] = notification_type
+
+        message = messaging.Message(
+            token        = device_token,
+            notification = messaging.Notification(title=title, body=body),
+            data         = {k: str(v) for k, v in payload.items()},
+            android      = messaging.AndroidConfig(
+                priority            = "high",
+                notification        = messaging.AndroidNotification(
+                    channel_id      = _channel_id(notification_type),
+                    priority        = "high",
+                    default_sound   = True,
+                    default_vibrate_timings = True,
+                ),
+            ),
+        )
+        response = messaging.send(message)
+        logger.info("FCM push sent. message_id=%s token=%s", response, device_token[:20])
+        return True
+
+    except Exception as e:
+        logger.error("FCM push failed for token %s: %s", device_token[:20], e)
+        return False
+
+
+def send_push_multicast(device_tokens: list[str], title: str, body: str, data: dict | None = None) -> dict:
+    """Send the same notification to multiple devices (up to 500)."""
+    if not device_tokens:
+        return {"success": 0, "failure": 0}
+
+    try:
+        _get_firebase_app()
+        from firebase_admin import messaging
+
+        payload = data or {}
+        message = messaging.MulticastMessage(
+            tokens       = device_tokens[:500],
+            notification = messaging.Notification(title=title, body=body),
+            data         = {k: str(v) for k, v in payload.items()},
+            android      = messaging.AndroidConfig(priority="high"),
+        )
+        response = messaging.send_each_for_multicast(message)
+        return {
+            "success": response.success_count,
+            "failure": response.failure_count,
+        }
+    except Exception as e:
+        logger.error("FCM multicast failed: %s", e)
+        return {"success": 0, "failure": len(device_tokens)}
+
+
+def _channel_id(notification_type: str) -> str:
+    """Map notification type to Android notification channel ID."""
+    channels = {
+        "message":        "yaap_messages",
+        "call":           "yaap_calls",
+        "friend_request": "yaap_social",
+        "voice_trained":  "yaap_system",
+    }
+    return channels.get(notification_type, "yaap_general")
+
+
+# ─── Convenience helpers used by views/consumers ─────────────────────────────
+
+def notify_new_message(recipient_tokens: list[str], sender_name: str, preview: str, conversation_id: str):
+    send_push_multicast(
+        device_tokens = recipient_tokens,
+        title         = sender_name,
+        body          = preview,
+        data          = {"conversation_id": conversation_id, "type": "message"},
+    )
+
+
+def notify_incoming_call(callee_token: str, caller_name: str, room_id: str, caller_avatar: str = ""):
+    send_push(
+        device_token      = callee_token,
+        title             = "Incoming Call",
+        body              = f"{caller_name} is calling you",
+        data              = {"room_id": room_id, "caller_name": caller_name, "caller_avatar": caller_avatar},
+        notification_type = "call",
+    )
+
+
+def notify_friend_request(recipient_token: str, requester_name: str, request_id: str):
+    send_push(
+        device_token      = recipient_token,
+        title             = "New Friend Request",
+        body              = f"{requester_name} sent you a friend request",
+        data              = {"request_id": request_id},
+        notification_type = "friend_request",
+    )
+
+
+def notify_voice_training_complete(user_token: str):
+    send_push(
+        device_token      = user_token,
+        title             = "Voice Profile Ready!",
+        body              = "Your voice has been cloned. You can now make translated calls.",
+        notification_type = "voice_trained",
+    )
+# ===== d:/yaap1/YAAP\backend\services\supabase_client.py =====
+"""
+Supabase Client Service
+Provides singleton-pattern clients for:
+  - Admin client  (service role key — server only, never sent to clients)
+  - Storage client (for avatar and voice sample uploads)
+
+All Supabase interactions go through this module so credentials
+are never scattered across the codebase.
+"""
+
+import logging
+from functools import lru_cache
+from django.conf import settings
+from supabase import create_client, Client
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def get_supabase_admin_client() -> Client:
+    """
+    Returns a Supabase client authenticated with the SERVICE ROLE key.
+    This client bypasses Row Level Security — use only server-side.
+    The lru_cache ensures we reuse the same client instance (connection pooling).
+    """
+    client = create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_SERVICE_ROLE_KEY,
+    )
+    logger.debug("Supabase admin client initialized.")
+    return client
+
+
+@lru_cache(maxsize=1)
+def get_supabase_anon_client() -> Client:
+    """
+    Returns a Supabase client authenticated with the ANON key.
+    Subject to Row Level Security — use for user-context operations.
+    """
+    client = create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_ANON_KEY,
+    )
+    return client
+
+
+def get_supabase_storage_client():
+    """Returns the storage interface from the admin client."""
+    return get_supabase_admin_client().storage
+
+
+def get_signed_url(bucket: str, path: str, expires_in: int = 300) -> str:
+    """
+    Generate a signed URL for private file access.
+    Default expiry: 300 seconds (5 minutes).
+    """
+    storage = get_supabase_storage_client()
+    result  = storage.from_(bucket).create_signed_url(path, expires_in)
+    return result.get("signedURL", "")
+
+
+def upload_file(bucket: str, path: str, file_bytes: bytes, content_type: str = "application/octet-stream") -> str:
+    """
+    Upload bytes to Supabase Storage.
+    Returns the public URL (for public buckets) or the storage path.
+    """
+    storage = get_supabase_storage_client()
+    storage.from_(bucket).upload(
+        path         = path,
+        file         = file_bytes,
+        file_options = {"content-type": content_type, "upsert": "true"},
+    )
+    public_url = storage.from_(bucket).get_public_url(path)
+    return public_url
+
+
+def delete_file(bucket: str, path: str) -> bool:
+    """Delete a file from Supabase Storage. Returns True on success."""
+    try:
+        get_supabase_storage_client().from_(bucket).remove([path])
+        return True
+    except Exception as e:
+        logger.error("Failed to delete %s/%s from Supabase Storage: %s", bucket, path, e)
+        return False
+
+
+def verify_supabase_jwt(token: str) -> dict | None:
+    """
+    Verify a Supabase-issued JWT and return the payload.
+    Used by the WebSocket JWTAuthMiddleware to authenticate WS connections.
+    """
+    import jwt
+    from django.conf import settings
+
+    try:
+        payload = jwt.decode(
+            token,
+            settings.SUPABASE_ANON_KEY,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        logger.warning("Supabase JWT expired.")
+        return None
+    except jwt.InvalidTokenError as e:
+        logger.warning("Invalid Supabase JWT: %s", e)
+        return None
+# ===== d:/yaap1/YAAP\backend\services\translation.py =====
+"""
+Translation Service
+Primary:  DeepL API (highest quality)
+Fallback: Helsinki-NLP Opus-MT (free, offline)
+Caching:  Django cache keyed by SHA256(original_text + target_lang)
+          Avoids re-translating identical text.
+"""
+
+import hashlib
+import logging
+
+from django.conf import settings
+from django.core.cache import cache
+
+logger = logging.getLogger(__name__)
+
+# DeepL language code mapping (XTTS code → DeepL code)
+DEEPL_LANG_MAP = {
+    "en": "EN-US", "es": "ES", "fr": "FR", "de": "DE",
+    "it": "IT",    "pt": "PT-PT", "pl": "PL", "tr": "TR",
+    "ru": "RU",    "nl": "NL",   "cs": "CS", "ar": "AR",
+    "zh": "ZH",    "ja": "JA",   "ko": "KO", "hu": "HU",
+    "hi": None,    # DeepL doesn't support Hindi — falls back to Helsinki
+}
+
+CACHE_TIMEOUT = 60 * 60 * 24 * 7   # 7 days — translations don't expire
+
+
+def translate(text: str, target_language: str, source_language: str = None) -> str:
+    """
+    Translate `text` into `target_language`.
+    Returns original text if both languages are the same or on complete failure.
+    All results are cached to avoid redundant API calls.
+
+    Args:
+        text:            Text to translate
+        target_language: XTTS language code (e.g. 'ar', 'de', 'zh')
+        source_language: Optional hint; if None, auto-detected
+
+    Returns:
+        Translated string
+    """
+    if not text or not text.strip():
+        return text
+
+    if source_language and source_language == target_language:
+        return text
+
+    cache_key = _cache_key(text, target_language)
+    cached    = cache.get(cache_key)
+    if cached:
+        logger.debug("Translation cache hit: lang=%s", target_language)
+        return cached
+
+    translated = _try_deepl(text, target_language, source_language)
+    if translated is None:
+        translated = _try_helsinki(text, target_language, source_language)
+    if translated is None:
+        logger.error("All translation providers failed for lang=%s", target_language)
+        return text
+
+    cache.set(cache_key, translated, timeout=CACHE_TIMEOUT)
+    return translated
+
+
+def _cache_key(text: str, target_language: str) -> str:
+    digest = hashlib.sha256(f"{text}::{target_language}".encode()).hexdigest()
+    return f"yaap:translation:{digest}"
+
+
+# ─── DeepL ────────────────────────────────────────────────────────────────────
+
+def _try_deepl(text: str, target_language: str, source_language: str = None) -> str | None:
+    api_key   = settings.DEEPL_API_KEY
+    deepl_target = DEEPL_LANG_MAP.get(target_language)
+
+    if not api_key or not deepl_target:
+        return None
+
+    try:
+        import deepl
+        translator = deepl.Translator(api_key)
+        result     = translator.translate_text(
+            text,
+            target_lang  = deepl_target,
+            source_lang  = DEEPL_LANG_MAP.get(source_language) if source_language else None,
+        )
+        logger.info("DeepL translation: %s → %s (%d chars)", source_language, target_language, len(text))
+        return result.text
+    except Exception as e:
+        logger.warning("DeepL translation failed: %s", e)
+        return None
+
+
+# ─── Helsinki-NLP Opus-MT (fallback) ──────────────────────────────────────────
+
+_helsinki_pipelines: dict = {}   # cache loaded pipelines in memory
+
+
+def _try_helsinki(text: str, target_language: str, source_language: str = None) -> str | None:
+    """
+    Uses the 'opus-mt' MarianMT models from Helsinki-NLP via HuggingFace transformers.
+    Models are downloaded on first use (cached to ~/.cache/huggingface/).
+    """
+    try:
+        from transformers import pipeline
+
+        src  = source_language or "en"
+        key  = f"{src}-{target_language}"
+        model_name = f"Helsinki-NLP/opus-mt-{src}-{target_language}"
+
+        if key not in _helsinki_pipelines:
+            logger.info("Loading Helsinki-NLP model: %s", model_name)
+            _helsinki_pipelines[key] = pipeline("translation", model=model_name)
+
+        pipe   = _helsinki_pipelines[key]
+        result = pipe(text, max_length=512)
+        logger.info("Helsinki-NLP translation: %s → %s", src, target_language)
+        return result[0]["translation_text"]
+
+    except Exception as e:
+        logger.warning("Helsinki-NLP translation failed for %s→%s: %s", source_language, target_language, e)
+        return None
+
+
+# ─── Async Celery task wrapper ────────────────────────────────────────────────
+
+from celery import shared_task
+
+
+@shared_task(name="translation.translate_message", queue="translation")
+def translate_message_task(message_id: str, target_language: str):
+    """
+    Celery task: translate a message and store result in MessageTranslation.
+    Called automatically when a message is received by a user with a different
+    language preference.
+
+    After saving, pushes the translation to the conversation's WebSocket group
+    so the receiver sees it in real-time.
+    """
+    from apps.messaging.models import Message, MessageTranslation
+
+    try:
+        message = Message.objects.get(id=message_id)
+        if message.deleted_for_everyone:
+            return
+
+        # Skip if translation already exists
+        if MessageTranslation.objects.filter(message=message, language=target_language).exists():
+            return
+
+        translated = translate(
+            text             = message.content,
+            target_language  = target_language,
+            source_language  = message.original_language,
+        )
+
+        MessageTranslation.objects.create(
+            message            = message,
+            language           = target_language,
+            translated_content = translated,
+        )
+        logger.info("Message %s translated to %s", message_id, target_language)
+
+        # Push translated content to the conversation WebSocket group in real-time
+        _push_translation_to_ws(message, target_language, translated)
+
+    except Message.DoesNotExist:
+        logger.warning("translate_message_task: message %s not found", message_id)
+    except Exception as e:
+        logger.error("translate_message_task failed: %s", e)
+        raise
+
+
+def _push_translation_to_ws(message, target_language: str, translated_content: str):
+    """
+    Send translated message content to the conversation's WebSocket channel group.
+    The ChatConsumer's `chat_message_translated` handler will only deliver it
+    to the user whose language_preference matches.
+    """
+    try:
+        from channels.layers import get_channel_layer
+        from asgiref.sync import async_to_sync
+
+        channel_layer = get_channel_layer()
+        if channel_layer is None:
+            logger.warning("No channel layer configured; cannot push translation via WS.")
+            return
+
+        group_name = f"chat_{message.conversation_id}"
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type": "chat.message_translated",
+                "payload": {
+                    "message_id": str(message.id),
+                    "language": target_language,
+                    "translated_content": translated_content,
+                },
+            },
+        )
+        logger.info("Pushed translation for message %s to WS group %s", message.id, group_name)
+    except Exception as e:
+        # Non-fatal: the translation is saved in DB regardless
+        logger.warning("Failed to push translation via WS: %s", e)
+
+# ===== d:/yaap1/YAAP\backend\services\whisper_service.py =====
+"""
+Whisper Speech-to-Text Service Client
+Wraps the OpenAI Whisper inference microservice for:
+  - Voice training audio validation (detect silence, wrong language)
+  - Real-time call transcription (Phase 7)
+
+The Whisper microservice runs whisper large-v3 and exposes:
+  POST /transcribe  — transcribe audio, returns {text, language, segments}
+  GET  /health      — health check
+"""
+
+import logging
+
+import httpx
+from django.conf import settings
+
+logger          = logging.getLogger(__name__)
+WHISPER_URL     = settings.WHISPER_SERVICE_URL
+WHISPER_TIMEOUT = 60.0   # large-v3 on CPU can take up to 45 s
+
+
+def transcribe(
+    audio_bytes: bytes,
+    language: str | None = None,
+    content_type: str    = "audio/wav",
+    filename: str        = "audio.wav",
+) -> dict | None:
+    """
+    Transcribe audio bytes using Whisper.
+
+    Args:
+        audio_bytes:  Raw audio file bytes (WAV / MP3 / OGG)
+        language:     ISO language code hint (e.g. 'ar'). None = auto-detect.
+        content_type: MIME type of audio_bytes
+        filename:     Filename sent in multipart
+
+    Returns:
+        {
+            "text":     str,           # full transcript
+            "language": str,           # detected or provided language code
+            "segments": list[dict],    # word-level timing segments
+            "duration": float,         # audio duration in seconds
+        }
+        or None on failure.
+    """
+    try:
+        files  = {"audio_file": (filename, audio_bytes, content_type)}
+        params = {}
+        if language:
+            params["language"] = language
+
+        response = httpx.post(
+            f"{WHISPER_URL}/transcribe",
+            files   = files,
+            params  = params,
+            timeout = WHISPER_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        logger.info(
+            "Whisper transcribed %d bytes: lang=%s duration=%.1fs chars=%d",
+            len(audio_bytes),
+            data.get("language"),
+            data.get("duration", 0),
+            len(data.get("text", "")),
+        )
+        return data
+
+    except httpx.TimeoutException:
+        logger.error("Whisper /transcribe timed out after %.0fs", WHISPER_TIMEOUT)
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.error("Whisper /transcribe HTTP error %s: %s", e.response.status_code, e.response.text)
+        return None
+    except Exception as e:
+        logger.exception("Whisper /transcribe unexpected error: %s", e)
+        return None
+
+
+def is_whisper_service_healthy() -> bool:
+    try:
+        r = httpx.get(f"{WHISPER_URL}/health", timeout=5.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+# ===== d:/yaap1/YAAP\backend\services\xtts_client.py =====
+"""
+XTTS Microservice Client
+Communicates with the Coqui XTTS inference server (a separate Python
+microservice running coqui-ai/TTS).
+
+The microservice exposes two endpoints:
+  POST /embed   — compute speaker embedding from WAV bytes
+  POST /synthesize — synthesize speech from text + embedding (Phase 7)
+
+We use httpx for async-capable HTTP calls from both sync (Celery) and
+async (Django Channels) contexts.
+"""
+
+import logging
+from io import BytesIO
+from pathlib import Path
+
+import httpx
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+XTTS_URL          = settings.XTTS_SERVICE_URL
+REQUEST_TIMEOUT   = 120.0    # embedding takes up to 60 s on CPU
+SYNTHESIS_TIMEOUT = 30.0
+
+
+# ─── Speaker Embedding ────────────────────────────────────────────────────────
+
+def compute_speaker_embedding(wav_paths: list[str]) -> list[float] | None:
+    """
+    Send multiple WAV file bytes to the XTTS microservice and receive back
+    a 256-dimensional speaker embedding vector (list of floats).
+
+    Args:
+        wav_paths: Local filesystem paths to the VAD-trimmed WAV files.
+
+    Returns:
+        List of 256 floats representing the speaker embedding, or None on failure.
+    """
+    if not wav_paths:
+        logger.error("compute_speaker_embedding: no wav_paths provided")
+        return None
+
+    try:
+        # Build multipart form with all WAV files
+        files = []
+        for path in wav_paths:
+            p = Path(path)
+            if not p.exists():
+                logger.warning("WAV file not found: %s", path)
+                continue
+            files.append(("wav_files", (p.name, p.read_bytes(), "audio/wav")))
+
+        if not files:
+            logger.error("No valid WAV files to send to XTTS service")
+            return None
+
+        response = httpx.post(
+            f"{XTTS_URL}/embed",
+            files   = files,
+            timeout = REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        data      = response.json()
+        embedding = data.get("embedding")
+
+        if not embedding or not isinstance(embedding, list):
+            logger.error("XTTS /embed returned unexpected payload: %s", data)
+            return None
+
+        logger.info(
+            "XTTS embedding computed: dim=%d from %d WAV files",
+            len(embedding), len(files),
+        )
+        return embedding
+
+    except httpx.TimeoutException:
+        logger.error("XTTS /embed timed out after %.0fs", REQUEST_TIMEOUT)
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.error("XTTS /embed HTTP error: %s — %s", e.response.status_code, e.response.text)
+        return None
+    except Exception as e:

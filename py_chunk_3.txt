@@ -1,0 +1,800 @@
+    answered_at      = models.DateTimeField(null=True, blank=True)
+    ended_at         = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    caller_language  = models.CharField(max_length=5, default="en")
+    callee_language  = models.CharField(max_length=5, default="en")
+
+    class Meta:
+        db_table = "call_rooms"
+        indexes  = [
+            models.Index(fields=["caller", "-started_at"]),
+            models.Index(fields=["callee", "-started_at"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["room_id"]),
+        ]
+
+    def __str__(self):
+        return f"Call {self.caller} → {self.callee} [{self.status}]"
+
+    def answer(self):
+        self.status      = self.Status.ANSWERED
+        self.answered_at = timezone.now()
+        self.save(update_fields=["status", "answered_at"])
+
+    def decline(self):
+        self.status   = self.Status.DECLINED
+        self.ended_at = timezone.now()
+        self.save(update_fields=["status", "ended_at"])
+
+    def end(self):
+        now = timezone.now()
+        self.status   = self.Status.ENDED
+        self.ended_at = now
+        if self.answered_at:
+            self.duration_seconds = int((now - self.answered_at).total_seconds())
+        self.save(update_fields=["status", "ended_at", "duration_seconds"])
+
+    def mark_missed(self):
+        self.status   = self.Status.MISSED
+        self.ended_at = timezone.now()
+        self.save(update_fields=["status", "ended_at"])
+
+    @property
+    def is_active(self):
+        return self.status in (self.Status.INITIATED, self.Status.ANSWERED)
+
+    @property
+    def translation_needed(self):
+        return self.caller_language != self.callee_language
+
+
+class IceCredential(models.Model):
+    TURN_TTL = 3600
+
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    room       = models.OneToOneField(CallRoom, on_delete=models.CASCADE, related_name="ice_credential")
+    username   = models.CharField(max_length=128)
+    credential = models.CharField(max_length=256)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "ice_credentials"
+
+    @classmethod
+    def generate_for_room(cls, room):
+        import base64
+        expiry      = int(time.time()) + cls.TURN_TTL
+        username    = f"{expiry}:{room.caller_id}"
+        secret      = getattr(settings, "COTURN_SECRET", "yaap-turn-secret-change-in-prod")
+        raw_hmac    = hmac.new(secret.encode(), username.encode(), digestmod=hashlib.sha1).digest()
+        credential  = base64.b64encode(raw_hmac).decode()
+        return cls.objects.create(
+            room       = room,
+            username   = username,
+            credential = credential,
+            expires_at = timezone.now() + timezone.timedelta(seconds=cls.TURN_TTL),
+        )
+# ===== d:/yaap1/YAAP\backend\apps\calls\serializers.py =====
+"""Calls Serializers"""
+from rest_framework import serializers
+from apps.accounts.serializers import UserMiniSerializer
+from .models import CallRoom, IceCredential
+
+
+class CallRoomSerializer(serializers.ModelSerializer):
+    caller = UserMiniSerializer(read_only=True)
+    callee = UserMiniSerializer(read_only=True)
+    translation_needed = serializers.BooleanField(read_only=True)
+    class Meta:
+        model  = CallRoom
+        fields = ["id","room_id","caller","callee","status","caller_language",
+                  "callee_language","translation_needed","started_at",
+                  "answered_at","ended_at","duration_seconds"]
+        read_only_fields = fields
+
+
+class CallHistorySerializer(serializers.ModelSerializer):
+    other_user = serializers.SerializerMethodField()
+    direction  = serializers.SerializerMethodField()
+    class Meta:
+        model  = CallRoom
+        fields = ["id","room_id","other_user","direction","status","duration_seconds","started_at"]
+        read_only_fields = fields
+    def get_other_user(self, obj):
+        user  = self.context["request"].user
+        other = obj.callee if obj.caller_id == user.id else obj.caller
+        return {"id": str(other.id), "display_name": other.name,
+                "avatar_url": other.avatar_url, "country_code": other.country_code}
+    def get_direction(self, obj):
+        return "outgoing" if obj.caller_id == self.context["request"].user.id else "incoming"
+
+
+class InitiateCallSerializer(serializers.Serializer):
+    callee_id = serializers.UUIDField()
+    def validate_callee_id(self, value):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        req  = self.context["request"].user
+        if str(value) == str(req.id):
+            raise serializers.ValidationError("Cannot call yourself.")
+        try:
+            callee = User.objects.get(id=value, is_active=True)
+        except User.DoesNotExist:
+            raise serializers.ValidationError("User not found.")
+        from apps.friendships.models import Friendship
+        if not Friendship.objects.are_friends(req, callee):
+            raise serializers.ValidationError("Must be friends to call.")
+        if CallRoom.objects.filter(caller=req, callee=callee,
+            status__in=[CallRoom.Status.INITIATED, CallRoom.Status.ANSWERED]).exists():
+            raise serializers.ValidationError("Active call already exists.")
+        return value
+# ===== d:/yaap1/YAAP\backend\apps\calls\urls.py =====
+from django.urls import path
+from .views import (
+    InitiateCallView, IceConfigView, EndCallView,
+    DeclineCallView, CallHistoryView, ActiveCallView,
+)
+
+urlpatterns = [
+    path("initiate/",                    InitiateCallView.as_view(),  name="call-initiate"),
+    path("ice-config/<uuid:room_id>/",   IceConfigView.as_view(),     name="call-ice-config"),
+    path("<uuid:room_id>/end/",          EndCallView.as_view(),       name="call-end"),
+    path("<uuid:room_id>/decline/",      DeclineCallView.as_view(),   name="call-decline"),
+    path("history/",                     CallHistoryView.as_view(),   name="call-history"),
+    path("active/",                      ActiveCallView.as_view(),    name="call-active"),
+]
+# ===== d:/yaap1/YAAP\backend\apps\calls\views.py =====
+"""Calls REST Views"""
+import logging
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+from drf_spectacular.utils import extend_schema, OpenApiParameter
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from .models import CallRoom, IceCredential
+from .serializers import CallHistorySerializer, CallRoomSerializer, InitiateCallSerializer
+
+logger = logging.getLogger(__name__)
+User   = get_user_model()
+
+def _ok(d, sc=status.HTTP_200_OK):  return Response({"success": True,  "data": d}, status=sc)
+def _err(c, m, sc=status.HTTP_400_BAD_REQUEST): return Response({"success": False, "error": {"code": c, "message": m}}, status=sc)
+
+
+class InitiateCallView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        s = InitiateCallSerializer(data=request.data, context={"request": request})
+        s.is_valid(raise_exception=True)
+        callee = User.objects.get(id=s.validated_data["callee_id"])
+        caller = request.user
+        room   = CallRoom.objects.create(
+            caller=caller, callee=callee,
+            caller_language=caller.language_preference,
+            callee_language=callee.language_preference,
+        )
+        ice_cred = IceCredential.generate_for_room(room)
+        _push_incoming_call(callee, caller, room)
+
+        from tasks.call_tasks import mark_missed_if_unanswered
+        mark_missed_if_unanswered.apply_async(args=[str(room.id)], countdown=30, queue="default")
+
+        logger.info("Call initiated: room=%s caller=%s callee=%s", room.room_id, caller.id, callee.id)
+        return _ok({
+            "room":    CallRoomSerializer(room).data,
+            "ice":     {"username": ice_cred.username, "credential": ice_cred.credential, "expires_at": ice_cred.expires_at.isoformat()},
+            "ws_url":  f"ws://{{host}}/ws/calls/{room.room_id}/",
+        }, status.HTTP_201_CREATED)
+
+
+class IceConfigView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, room_id):
+        try:
+            room = CallRoom.objects.select_related("ice_credential").get(room_id=room_id)
+        except CallRoom.DoesNotExist:
+            return _err("NOT_FOUND", "Call room not found.", status.HTTP_404_NOT_FOUND)
+        if request.user.id not in (room.caller_id, room.callee_id):
+            return _err("FORBIDDEN", "Not a participant.", status.HTTP_403_FORBIDDEN)
+        try:
+            cred = room.ice_credential
+        except IceCredential.DoesNotExist:
+            cred = IceCredential.generate_for_room(room)
+
+        from django.conf import settings
+        turn_host = getattr(settings, "COTURN_HOST", "turn.yaap.app")
+        turn_port = getattr(settings, "COTURN_PORT", 3478)
+        ice_servers = [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun1.l.google.com:19302"},
+            {"urls": f"turn:{turn_host}:{turn_port}", "username": cred.username, "credential": cred.credential},
+            {"urls": f"turns:{turn_host}:{turn_port}?transport=tcp", "username": cred.username, "credential": cred.credential},
+        ]
+        return _ok({"ice_servers": ice_servers, "username": cred.username, "credential": cred.credential,
+                    "expires_at": cred.expires_at.isoformat(), "room_id": str(room.room_id)})
+
+
+class EndCallView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, room_id):
+        try:
+            room = CallRoom.objects.get(room_id=room_id)
+        except CallRoom.DoesNotExist:
+            return _err("NOT_FOUND", "Call not found.", status.HTTP_404_NOT_FOUND)
+        if request.user.id not in (room.caller_id, room.callee_id):
+            return _err("FORBIDDEN", "Not a participant.", status.HTTP_403_FORBIDDEN)
+        if not room.is_active:
+            return _err("NOT_ACTIVE", f"Call is already {room.status}.")
+        room.end()
+        return _ok({"message": "Call ended.", "duration_seconds": room.duration_seconds})
+
+
+class DeclineCallView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, room_id):
+        try:
+            room = CallRoom.objects.get(room_id=room_id, callee=request.user)
+        except CallRoom.DoesNotExist:
+            return _err("NOT_FOUND", "Call not found.", status.HTTP_404_NOT_FOUND)
+        if room.status != CallRoom.Status.INITIATED:
+            return _err("NOT_RINGING", "Call is not ringing.")
+        room.decline()
+        return _ok({"message": "Call declined."})
+
+
+class CallHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        page      = max(1, int(request.query_params.get("page", 1)))
+        page_size = min(int(request.query_params.get("page_size", 20)), 50)
+        filter_by = request.query_params.get("filter", "all")
+
+        qs = CallRoom.objects.filter(
+            Q(caller=request.user) | Q(callee=request.user)
+        ).select_related("caller", "callee").order_by("-started_at")
+
+        if filter_by == "missed":    qs = qs.filter(callee=request.user, status=CallRoom.Status.MISSED)
+        elif filter_by == "incoming": qs = qs.filter(callee=request.user)
+        elif filter_by == "outgoing": qs = qs.filter(caller=request.user)
+
+        total  = qs.count()
+        offset = (page - 1) * page_size
+        calls  = qs[offset: offset + page_size]
+        s      = CallHistorySerializer(calls, many=True, context={"request": request})
+        return _ok({"calls": s.data, "total": total, "page": page, "page_size": page_size, "has_more": offset + page_size < total})
+
+
+class ActiveCallView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        room = CallRoom.objects.filter(
+            Q(caller=request.user) | Q(callee=request.user),
+            status__in=[CallRoom.Status.INITIATED, CallRoom.Status.ANSWERED],
+        ).select_related("caller", "callee").order_by("-started_at").first()
+        return _ok({"active_call": CallRoomSerializer(room).data if room else None})
+
+
+def _push_incoming_call(callee, caller, room):
+    try:
+        from apps.friendships.models import UserDevice
+        from services.fcm_service import notify_incoming_call
+        tokens = list(UserDevice.objects.filter(user=callee).values_list("fcm_token", flat=True))
+        for token in tokens:
+            notify_incoming_call(token, caller.name, str(room.room_id), caller.avatar_url)
+    except Exception as e:
+        logger.warning("FCM call push failed: %s", e)
+# ===== d:/yaap1/YAAP\backend\apps\calls\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\calls\tests\test_calls.py =====
+"""
+Calls app tests — Phase 6
+Covers: initiate, ICE config, end, decline, history, active call,
+missed timeout task, SignalingConsumer state transitions.
+"""
+
+import pytest
+from unittest.mock import MagicMock, patch
+from django.utils import timezone
+
+from apps.calls.models import CallRoom, IceCredential
+from apps.friendships.models import Friendship, FriendRequest
+
+
+def make_friends(user_a, user_b):
+    req = FriendRequest.objects.create(from_user=user_a, to_user=user_b)
+    req.accept()
+
+
+# ─── Initiate Call ────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestInitiateCall:
+    URL = "/api/v1/calls/initiate/"
+
+    @patch("apps.calls.views._push_incoming_call")
+    @patch("tasks.call_tasks.mark_missed_if_unanswered.apply_async")
+    def test_initiate_success(self, mock_task, mock_push, auth_client, user_b):
+        client, user = auth_client
+        make_friends(user, user_b)
+        resp = client.post(self.URL, {"callee_id": str(user_b.id)})
+        assert resp.status_code == 201
+        data = resp.json()["data"]
+        assert data["room"]["status"] == "initiated"
+        assert data["room"]["caller"]["id"] == str(user.id)
+        assert data["room"]["callee"]["id"] == str(user_b.id)
+        assert "ice" in data
+        assert "ws_url" in data
+        assert CallRoom.objects.filter(caller=user, callee=user_b).exists()
+        mock_push.assert_called_once()
+        mock_task.assert_called_once()
+
+    def test_cannot_call_self(self, auth_client):
+        client, user = auth_client
+        resp = client.post(self.URL, {"callee_id": str(user.id)})
+        assert resp.status_code == 400
+
+    def test_cannot_call_non_friend(self, auth_client, user_b):
+        client, user = auth_client
+        resp = client.post(self.URL, {"callee_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    @patch("apps.calls.views._push_incoming_call")
+    @patch("tasks.call_tasks.mark_missed_if_unanswered.apply_async")
+    def test_no_duplicate_active_call(self, mock_task, mock_push, auth_client, user_b):
+        client, user = auth_client
+        make_friends(user, user_b)
+        CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.INITIATED,
+        )
+        resp = client.post(self.URL, {"callee_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    def test_requires_auth(self, api_client, user_b):
+        resp = api_client.post(self.URL, {"callee_id": str(user_b.id)})
+        assert resp.status_code == 401
+
+
+# ─── ICE Config ──────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestIceConfig:
+
+    def _make_room(self, caller, callee):
+        return CallRoom.objects.create(
+            caller=caller, callee=callee,
+            caller_language="en", callee_language="ar",
+        )
+
+    def test_caller_gets_ice_config(self, auth_client, user_b):
+        client, user = auth_client
+        make_friends(user, user_b)
+        room = self._make_room(user, user_b)
+        resp = client.get(f"/api/v1/calls/ice-config/{room.room_id}/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert "ice_servers" in data
+        assert len(data["ice_servers"]) == 4
+        assert "username" in data
+        assert "credential" in data
+
+    def test_callee_gets_ice_config(self, auth_client_b, user):
+        client, callee = auth_client_b
+        make_friends(user, callee)
+        room = CallRoom.objects.create(
+            caller=user, callee=callee,
+            caller_language="en", callee_language="ar",
+        )
+        resp = client.get(f"/api/v1/calls/ice-config/{room.room_id}/")
+        assert resp.status_code == 200
+
+    def test_non_participant_forbidden(self, auth_client, user_b, user_c):
+        client, user = auth_client
+        room = CallRoom.objects.create(
+            caller=user_b, callee=user_c,
+            caller_language="en", callee_language="fr",
+        )
+        resp = client.get(f"/api/v1/calls/ice-config/{room.room_id}/")
+        assert resp.status_code == 403
+
+    def test_ice_credentials_generated_once(self, auth_client, user_b):
+        client, user = auth_client
+        make_friends(user, user_b)
+        room = self._make_room(user, user_b)
+        # First call creates credentials
+        resp1 = client.get(f"/api/v1/calls/ice-config/{room.room_id}/")
+        # Second call returns same credentials (not duplicated)
+        resp2 = client.get(f"/api/v1/calls/ice-config/{room.room_id}/")
+        assert resp1.json()["data"]["username"] == resp2.json()["data"]["username"]
+        assert IceCredential.objects.filter(room=room).count() == 1
+
+
+# ─── End Call ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestEndCall:
+
+    def test_caller_can_end(self, auth_client, user_b):
+        client, user = auth_client
+        make_friends(user, user_b)
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.ANSWERED,
+        )
+        from django.utils import timezone
+        room.answered_at = timezone.now()
+        room.save()
+        resp = client.post(f"/api/v1/calls/{room.room_id}/end/")
+        assert resp.status_code == 200
+        room.refresh_from_db()
+        assert room.status == CallRoom.Status.ENDED
+
+    def test_callee_can_end(self, auth_client_b, user):
+        client, callee = auth_client_b
+        make_friends(user, callee)
+        room = CallRoom.objects.create(
+            caller=user, callee=callee,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.ANSWERED,
+        )
+        resp = client.post(f"/api/v1/calls/{room.room_id}/end/")
+        assert resp.status_code == 200
+
+    def test_cannot_end_already_ended(self, auth_client, user_b):
+        client, user = auth_client
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.ENDED,
+        )
+        resp = client.post(f"/api/v1/calls/{room.room_id}/end/")
+        assert resp.status_code == 400
+
+
+# ─── Decline Call ─────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestDeclineCall:
+
+    def test_callee_can_decline(self, auth_client_b, user):
+        client, callee = auth_client_b
+        room = CallRoom.objects.create(
+            caller=user, callee=callee,
+            caller_language="en", callee_language="ar",
+        )
+        resp = client.post(f"/api/v1/calls/{room.room_id}/decline/")
+        assert resp.status_code == 200
+        room.refresh_from_db()
+        assert room.status == CallRoom.Status.DECLINED
+
+    def test_caller_cannot_decline(self, auth_client, user_b):
+        client, user = auth_client
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+        )
+        # auth_client is the caller — this endpoint only works for callee
+        resp = client.post(f"/api/v1/calls/{room.room_id}/decline/")
+        assert resp.status_code == 404  # callee=user_b, not user
+
+
+# ─── Call History ─────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestCallHistory:
+    URL = "/api/v1/calls/history/"
+
+    def _make_call(self, caller, callee, status=CallRoom.Status.ENDED):
+        return CallRoom.objects.create(
+            caller=caller, callee=callee,
+            caller_language="en", callee_language="ar",
+            status=status,
+        )
+
+    def test_lists_own_calls(self, auth_client, user_b, user_c):
+        client, user = auth_client
+        self._make_call(user, user_b)
+        self._make_call(user_c, user)
+        self._make_call(user_b, user_c)  # unrelated call
+        resp = client.get(self.URL)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["total"] == 2  # only calls involving user
+
+    def test_direction_outgoing(self, auth_client, user_b):
+        client, user = auth_client
+        self._make_call(user, user_b)
+        resp = client.get(self.URL)
+        calls = resp.json()["data"]["calls"]
+        assert calls[0]["direction"] == "outgoing"
+
+    def test_direction_incoming(self, auth_client, user_b):
+        client, user = auth_client
+        self._make_call(user_b, user)
+        resp = client.get(self.URL)
+        calls = resp.json()["data"]["calls"]
+        assert calls[0]["direction"] == "incoming"
+
+    def test_filter_missed(self, auth_client, user_b):
+        client, user = auth_client
+        self._make_call(user_b, user, status=CallRoom.Status.MISSED)
+        self._make_call(user_b, user, status=CallRoom.Status.ENDED)
+        resp = client.get(f"{self.URL}?filter=missed")
+        assert resp.json()["data"]["total"] == 1
+
+    def test_pagination(self, auth_client, user_b):
+        client, user = auth_client
+        for _ in range(25):
+            self._make_call(user, user_b)
+        resp = client.get(f"{self.URL}?page_size=10&page=1")
+        data = resp.json()["data"]
+        assert len(data["calls"]) == 10
+        assert data["has_more"] is True
+        assert data["total"] == 25
+
+
+# ─── Active Call ──────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestActiveCall:
+    URL = "/api/v1/calls/active/"
+
+    def test_no_active_call(self, auth_client):
+        client, _ = auth_client
+        resp = client.get(self.URL)
+        assert resp.status_code == 200
+        assert resp.json()["data"]["active_call"] is None
+
+    def test_returns_active_call(self, auth_client, user_b):
+        client, user = auth_client
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.ANSWERED,
+        )
+        resp = client.get(self.URL)
+        data = resp.json()["data"]["active_call"]
+        assert data is not None
+        assert str(data["room_id"]) == str(room.room_id)
+
+
+# ─── Missed Timeout Task ──────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestMissedTimeout:
+
+    @patch("services.fcm_service.send_push")
+    @patch("apps.friendships.models.UserDevice")
+    def test_marks_initiated_call_missed(self, mock_device, mock_push, user, user_b):
+        mock_device.objects.filter.return_value.values_list.return_value = []
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.INITIATED,
+        )
+        from tasks.call_tasks import mark_missed_if_unanswered
+        mark_missed_if_unanswered(str(room.id))
+        room.refresh_from_db()
+        assert room.status == CallRoom.Status.MISSED
+
+    @patch("apps.friendships.models.UserDevice")
+    def test_does_not_mark_answered_call_missed(self, mock_device, user, user_b):
+        mock_device.objects.filter.return_value.values_list.return_value = []
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.ANSWERED,
+        )
+        from tasks.call_tasks import mark_missed_if_unanswered
+        mark_missed_if_unanswered(str(room.id))
+        room.refresh_from_db()
+        assert room.status == CallRoom.Status.ANSWERED
+
+
+# ─── CallRoom Model ───────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestCallRoomModel:
+
+    def test_translation_needed_true(self, user, user_b):
+        room = CallRoom(caller=user, callee=user_b, caller_language="en", callee_language="ar")
+        assert room.translation_needed is True
+
+    def test_translation_needed_false_same_language(self, user, user_b):
+        room = CallRoom(caller=user, callee=user_b, caller_language="en", callee_language="en")
+        assert room.translation_needed is False
+
+    def test_is_active_initiated(self, user, user_b):
+        room = CallRoom(status=CallRoom.Status.INITIATED)
+        assert room.is_active is True
+
+    def test_is_active_ended(self, user, user_b):
+        room = CallRoom(status=CallRoom.Status.ENDED)
+        assert room.is_active is False
+
+    def test_duration_seconds_computed_on_end(self, user, user_b):
+        room = CallRoom.objects.create(
+            caller=user, callee=user_b,
+            caller_language="en", callee_language="ar",
+            status=CallRoom.Status.ANSWERED,
+        )
+        room.answered_at = timezone.now()
+        room.save()
+        import time; time.sleep(0.1)
+        room.end()
+        room.refresh_from_db()
+        assert room.duration_seconds is not None
+        assert room.duration_seconds >= 0
+# ===== d:/yaap1/YAAP\backend\apps\calls\tests\test_translation_pipeline.py =====
+"""
+Phase 7 — Translation Pipeline Tests
+Covers: TranslationConsumer, audio buffering, pipeline steps,
+silence detection, XTTS client, Whisper client.
+"""
+
+import io
+import struct
+import wave
+import math
+import pytest
+from unittest.mock import MagicMock, patch, AsyncMock
+
+from apps.calls.models import CallRoom
+
+
+# ─── Audio Helpers ────────────────────────────────────────────────────────────
+
+def make_pcm(duration_secs: float = 1.0, sample_rate: int = 16000, amplitude: int = 8000) -> bytes:
+    """Generate sine wave PCM bytes."""
+    num_samples = int(duration_secs * sample_rate)
+    samples     = [int(amplitude * math.sin(2 * math.pi * 440 * i / sample_rate)) for i in range(num_samples)]
+    return struct.pack(f"<{num_samples}h", *samples)
+
+
+def make_silence(duration_secs: float = 1.0, sample_rate: int = 16000) -> bytes:
+    num_samples = int(duration_secs * sample_rate)
+    return struct.pack(f"<{num_samples}h", *([0] * num_samples))
+
+
+def make_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+# ─── Silence Detection ────────────────────────────────────────────────────────
+
+class TestSilenceDetection:
+
+    def test_silence_detected(self):
+        from channels_consumers.translation_consumer import _is_silent
+        silent = make_silence(0.04)
+        assert _is_silent(silent) is True
+
+    def test_speech_not_silent(self):
+        from channels_consumers.translation_consumer import _is_silent
+        loud = make_pcm(0.04, amplitude=5000)
+        assert _is_silent(loud) is False
+
+    def test_empty_bytes_is_silent(self):
+        from channels_consumers.translation_consumer import _is_silent
+        assert _is_silent(b"") is True
+
+    def test_low_amplitude_is_silent(self):
+        from channels_consumers.translation_consumer import _is_silent
+        quiet = make_pcm(0.04, amplitude=50)   # below SILENCE_THRESHOLD=200
+        assert _is_silent(quiet) is True
+
+
+# ─── PCM to WAV conversion ────────────────────────────────────────────────────
+
+class TestPcmToWav:
+
+    def test_produces_valid_wav(self):
+        from channels_consumers.translation_consumer import _pcm_to_wav
+        pcm      = make_pcm(0.5)
+        wav      = _pcm_to_wav(pcm)
+        buf      = io.BytesIO(wav)
+        with wave.open(buf, "rb") as wf:
+            assert wf.getnchannels() == 1
+            assert wf.getsampwidth() == 2
+            assert wf.getframerate() == 16000
+
+    def test_wav_contains_correct_audio_length(self):
+        from channels_consumers.translation_consumer import _pcm_to_wav
+        pcm        = make_pcm(1.0)   # 1 second
+        wav        = _pcm_to_wav(pcm)
+        buf        = io.BytesIO(wav)
+        with wave.open(buf, "rb") as wf:
+            duration = wf.getnframes() / wf.getframerate()
+            assert abs(duration - 1.0) < 0.01
+
+
+# ─── Pipeline Step Functions ──────────────────────────────────────────────────
+
+class TestPipelineSteps:
+
+    @patch("services.whisper_service.transcribe")
+    def test_whisper_transcribe_returns_text(self, mock_transcribe):
+        mock_transcribe.return_value = {"text": "Hello world", "language": "en", "duration": 1.0, "segments": []}
+        from channels_consumers.translation_consumer import _whisper_transcribe
+        result = _whisper_transcribe(make_wav(make_pcm(1.0)), "en")
+        assert result == "Hello world"
+        mock_transcribe.assert_called_once()
+
+    @patch("services.whisper_service.transcribe")
+    def test_whisper_returns_none_on_failure(self, mock_transcribe):
+        mock_transcribe.return_value = None
+        from channels_consumers.translation_consumer import _whisper_transcribe
+        result = _whisper_transcribe(make_wav(make_pcm(1.0)), "en")
+        assert result is None
+
+    @patch("services.translation.translate")
+    def test_translate_text_success(self, mock_translate):
+        mock_translate.return_value = "مرحبا بالعالم"
+        from channels_consumers.translation_consumer import _translate_text
+        result = _translate_text("Hello world", "en", "ar")
+        assert result == "مرحبا بالعالم"
+        mock_translate.assert_called_once_with("Hello world", target_language="ar", source_language="en")
+
+    @patch("services.translation.translate")
+    def test_translate_returns_none_on_exception(self, mock_translate):
+        mock_translate.side_effect = Exception("DeepL API error")
+        from channels_consumers.translation_consumer import _translate_text
+        result = _translate_text("Hello", "en", "ar")
+        assert result is None
+
+    @patch("services.xtts_client.synthesize_speech")
+    def test_synthesize_returns_wav_bytes(self, mock_synth):
+        mock_synth.return_value = make_wav(make_pcm(0.5))
+        from channels_consumers.translation_consumer import _synthesize
+        result = _synthesize("مرحبا", [0.1] * 256, "ar")
+        assert isinstance(result, bytes)
+        assert len(result) > 0
+        mock_synth.assert_called_once_with(text="مرحبا", embedding=[0.1] * 256, language="ar")
+
+    @patch("services.xtts_client.synthesize_speech")
+    def test_synthesize_returns_none_on_failure(self, mock_synth):
+        mock_synth.return_value = None
+        from channels_consumers.translation_consumer import _synthesize
+        result = _synthesize("test", [0.1] * 256, "en")
+        assert result is None
+
+
+# ─── XTTS Client ─────────────────────────────────────────────────────────────
+
+class TestXttsClient:
+
+    @patch("httpx.post")
+    def test_compute_embedding_success(self, mock_post, tmp_path):
+        mock_response           = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"embedding": [0.1] * 256}
+        mock_post.return_value  = mock_response
+
+        # Create a temp WAV file
+        wav_path = tmp_path / "sample.wav"
+        wav_path.write_bytes(make_wav(make_pcm(4.0)))
+
+        from services.xtts_client import compute_speaker_embedding
+        result = compute_speaker_embedding([str(wav_path)])
+        assert result is not None
+        assert len(result) == 256
+
+    @patch("httpx.post")
+    def test_compute_embedding_returns_none_on_http_error(self, mock_post, tmp_path):
+        mock_response             = MagicMock()

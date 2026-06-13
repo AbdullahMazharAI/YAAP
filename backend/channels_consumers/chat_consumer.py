@@ -49,6 +49,12 @@ class ChatConsumer(BaseConsumer):
         except json.JSONDecodeError:
             await self.send_error("INVALID_JSON", "Message must be valid JSON.")
             return
+
+        logger.debug(
+            "ChatConsumer.receive: user=%s conv=%s type=%s",
+            self.user.id, self.conversation_id, msg_type,
+        )
+
         handlers = {
             "send_message":   self._handle_send_message,
             "typing_start":   self._handle_typing_start,
@@ -59,7 +65,14 @@ class ChatConsumer(BaseConsumer):
         }
         handler = handlers.get(msg_type)
         if handler:
-            await handler(payload)
+            try:
+                await handler(payload)
+            except Exception as exc:
+                logger.exception(
+                    "ChatConsumer unhandled error: user=%s conv=%s type=%s error=%r",
+                    self.user.id, self.conversation_id, msg_type, exc,
+                )
+                await self.send_error("INTERNAL_ERROR", "An internal server error occurred.")
         else:
             await self.send_error("UNKNOWN_TYPE", f"Unknown event: {msg_type}")
 
@@ -73,11 +86,19 @@ class ChatConsumer(BaseConsumer):
         if len(content) > 4000:
             await self.send_error("MESSAGE_TOO_LONG", "Max 4000 chars.")
             return
+
+        logger.debug("[CHAT] _handle_send_message: saving message for user=%s conv=%s", self.user.id, self.conversation_id)
         message = await self._save_message(content)
+        logger.debug("[CHAT] _handle_send_message: saved message id=%s", message.id)
+
+        serialized = await self._serialize_message(message)
+        logger.debug("[CHAT] _handle_send_message: broadcasting group_send to group=%s", self.group_name)
         await self.channel_layer.group_send(
             self.group_name,
-            {"type": "chat.message_new", "payload": await self._serialize_message(message)},
+            {"type": "chat.message_new", "payload": serialized},
         )
+        logger.debug("[CHAT] _handle_send_message: group_send complete")
+
         await self._enqueue_translation(message)
         await self._send_fcm_if_offline(message)
 
@@ -132,6 +153,7 @@ class ChatConsumer(BaseConsumer):
     # ── Group → Consumer dispatchers ──────────────────────────────────────────
 
     async def chat_message_new(self, event):
+        logger.debug("[CHAT] chat_message_new dispatched to user=%s", self.user.id)
         await self.send_event("chat.message_new", event["payload"])
 
     async def chat_typing_start(self, event):
@@ -178,6 +200,8 @@ class ChatConsumer(BaseConsumer):
             conversation=self.conversation, sender=self.user,
             content=content, original_language=self.user.language_preference,
         )
+        # Cache sender on the instance so _serialize_msg never triggers an extra DB hit
+        msg.sender = self.user
         self.conversation.last_message = msg
         self.conversation.save(update_fields=["last_message", "updated_at"])
         return msg
@@ -227,11 +251,11 @@ class ChatConsumer(BaseConsumer):
         has_more   = len(batch) > page_size
         batch      = batch[:page_size]
         next_cursor = batch[-1].created_at.isoformat() if has_more and batch else None
-        return [_serialize_msg(m) for m in batch], next_cursor
+        return [_serialize_msg(m, self.user.language_preference) for m in batch], next_cursor
 
     @database_sync_to_async
     def _serialize_message(self, message):
-        return _serialize_msg(message)
+        return _serialize_msg(message, self.user.language_preference)
 
     @database_sync_to_async
     def _enqueue_translation(self, message):
@@ -253,11 +277,19 @@ class ChatConsumer(BaseConsumer):
                 notify_new_message(tokens, self.user.name, message.content[:80], str(self.conversation.id))
 
 
-def _serialize_msg(m) -> dict:
+def _serialize_msg(m, preferred_language=None) -> dict:
+    translation_content = None
+    if preferred_language and preferred_language != m.original_language and not m.deleted_for_everyone:
+        t = m.translations.filter(language=preferred_language).first()
+        if t:
+            translation_content = t.translated_content
+
     return {
         "id": str(m.id), "conversation_id": str(m.conversation_id),
         "sender": {"id": str(m.sender_id), "display_name": getattr(m.sender, "name", ""), "avatar_url": getattr(m.sender, "avatar_url", "")},
         "content": m.content, "original_language": m.original_language,
         "status": m.status, "deleted_for_everyone": m.deleted_for_everyone,
+        "translation": translation_content,
         "created_at": m.created_at.isoformat(), "updated_at": m.updated_at.isoformat(),
     }
+

@@ -1,118 +1,3 @@
-"""
-YAAP Backend — Django Settings
-Supports: Dev (DEBUG=True) and Production (DEBUG=False) via environment variables.
-"""
-
-import os
-from datetime import timedelta
-from pathlib import Path
-
-import environ
-import sentry_sdk
-from sentry_sdk.integrations.django import DjangoIntegration
-from sentry_sdk.integrations.celery import CeleryIntegration
-from sentry_sdk.integrations.redis import RedisIntegration
-
-# ─── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-# ─── Environment ──────────────────────────────────────────────────────────────
-env = environ.Env(
-    DJANGO_DEBUG=(bool, False),
-    DJANGO_ALLOWED_HOSTS=(list, ["localhost", "127.0.0.1"]),
-    JWT_ACCESS_TOKEN_LIFETIME_MINUTES=(int, 15),
-    JWT_REFRESH_TOKEN_LIFETIME_DAYS=(int, 30),
-    OTP_EXPIRY_MINUTES=(int, 10),
-)
-environ.Env.read_env(BASE_DIR / ".env")
-
-# ─── Core ─────────────────────────────────────────────────────────────────────
-SECRET_KEY = env("DJANGO_SECRET_KEY")
-DEBUG = env("DJANGO_DEBUG")
-ALLOWED_HOSTS = ["*"] if DEBUG else env("DJANGO_ALLOWED_HOSTS")
-
-# ─── Applications ─────────────────────────────────────────────────────────────
-DJANGO_APPS = [
-    "django.contrib.admin",
-    "django.contrib.auth",
-    "django.contrib.contenttypes",
-    "django.contrib.sessions",
-    "django.contrib.messages",
-    "django.contrib.staticfiles",
-]
-
-THIRD_PARTY_APPS = [
-    "rest_framework",
-    "rest_framework_simplejwt",
-    "rest_framework_simplejwt.token_blacklist",
-    "corsheaders",
-    "channels",
-    "django_filters",
-    "django_celery_results",
-    "django_celery_beat",
-    "drf_spectacular",
-    "django_structlog",
-]
-
-LOCAL_APPS = [
-    "apps.accounts",
-    "apps.friendships",
-    "apps.messaging",
-    "apps.calls",
-    "apps.voice",
-]
-
-INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
-
-# ─── Middleware ───────────────────────────────────────────────────────────────
-MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.security.SecurityMiddleware",
-    "whitenoise.middleware.WhiteNoiseMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "django_structlog.middlewares.RequestMiddleware",
-]
-
-ROOT_URLCONF = "yaap.urls"
-
-TEMPLATES = [
-    {
-        "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "templates"],
-        "APP_DIRS": True,
-        "OPTIONS": {
-            "context_processors": [
-                "django.template.context_processors.debug",
-                "django.template.context_processors.request",
-                "django.contrib.auth.context_processors.auth",
-                "django.contrib.messages.context_processors.messages",
-            ],
-        },
-    },
-]
-
-# ─── ASGI / WSGI ──────────────────────────────────────────────────────────────
-WSGI_APPLICATION = "yaap.wsgi.application"
-ASGI_APPLICATION = "yaap.asgi.application"
-
-# ─── Database (Supabase PostgreSQL) ───────────────────────────────────────────
-DATABASES = {
-    "default": env.db("DATABASE_URL")
-}
-DATABASES["default"]["CONN_MAX_AGE"] = 0             # Supabase pooler requires 0 — persistent connections break with pgBouncer/Supabase pooling
-#DATABASES["default"]["CONN_MAX_AGE"] = 60           # only use this if connecting directly (not via pooler)
-
-DATABASES["default"]["OPTIONS"] = {
-    "connect_timeout": 10,
-    "keepalives": 1,
-    "keepalives_idle": 30,
-    "keepalives_interval": 10,
-    "keepalives_count": 5,
 }
 
 # ─── Cache & Channel Layer (Redis) ────────────────────────────────────────────
@@ -392,3 +277,135 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(minute=0),
     },
 }
+# ===== d:/yaap1/YAAP\backend\yaap\settings_test.py =====
+"""
+YAAP Test Settings
+Overrides production settings for fast, dependency-free local testing.
+  - SQLite in-memory DB  (no Supabase/PostgreSQL needed)
+  - Dummy cache          (no Redis needed)
+  - InMemory channel layer (no Redis needed)
+  - All external services mocked via environment flags
+  - Celery runs eagerly  (tasks execute synchronously, no broker needed)
+
+Usage:
+  DJANGO_SETTINGS_MODULE=yaap.settings_test pytest
+"""
+
+from yaap.settings import *   # noqa: F401,F403 — import everything then override
+
+# ─── Database — SQLite in memory ─────────────────────────────────────────────
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME":   ":memory:",
+    }
+}
+
+# ─── Cache — local memory, no Redis ──────────────────────────────────────────
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    }
+}
+
+# ─── Channel layer — in-memory, no Redis ─────────────────────────────────────
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
+    }
+}
+
+# ─── Celery — eager (synchronous) execution ───────────────────────────────────
+CELERY_TASK_ALWAYS_EAGER        = True
+CELERY_TASK_EAGER_PROPAGATES    = True
+
+# ─── Passwords — fastest hasher ───────────────────────────────────────────────
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.MD5PasswordHasher",
+]
+
+# ─── Email — capture in memory ────────────────────────────────────────────────
+EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+
+# ─── Disable Sentry ───────────────────────────────────────────────────────────
+SENTRY_DSN = ""
+
+# ─── Fake external service URLs ───────────────────────────────────────────────
+XTTS_SERVICE_URL    = "http://localhost:8001"
+WHISPER_SERVICE_URL = "http://localhost:8002"
+
+# ─── Supabase — fake keys (service is mocked in tests) ───────────────────────
+SUPABASE_URL              = "https://fake.supabase.co"
+SUPABASE_ANON_KEY         = "fake-anon-key"
+SUPABASE_SERVICE_ROLE_KEY = "fake-service-role-key"
+
+# ─── Google OAuth ─────────────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID     = "fake-google-client-id.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET = "fake-secret"
+
+# ─── Firebase ─────────────────────────────────────────────────────────────────
+FIREBASE_CREDENTIALS_PATH = "/tmp/fake-firebase.json"
+
+# ─── JWT — short lifetime for tests ──────────────────────────────────────────
+from datetime import timedelta
+SIMPLE_JWT = {
+    **SIMPLE_JWT,  # noqa: F405
+    "ACCESS_TOKEN_LIFETIME":  timedelta(minutes=60),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+}
+
+# ─── DeepL ────────────────────────────────────────────────────────────────────
+DEEPL_API_KEY = "fake-deepl-key"
+
+# ─── coturn ───────────────────────────────────────────────────────────────────
+COTURN_HOST   = "localhost"
+COTURN_PORT   = 3478
+COTURN_SECRET = "test-secret"
+
+# ─── Silence migration warnings ───────────────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="django")
+
+# ─── Logging — quiet during tests ─────────────────────────────────────────────
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": True,
+    "handlers": {"null": {"class": "logging.NullHandler"}},
+    "root": {"handlers": ["null"], "level": "CRITICAL"},
+}
+# ===== d:/yaap1/YAAP\backend\yaap\urls.py =====
+"""YAAP URL Configuration"""
+
+from django.contrib import admin
+from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
+
+urlpatterns = [
+    # ─── Admin ────────────────────────────────────────────────────────────────
+    path("admin/", admin.site.urls),
+
+    # ─── API v1 ───────────────────────────────────────────────────────────────
+    path("api/v1/auth/",        include("apps.accounts.urls.auth_urls")),
+    path("api/v1/users/",       include("apps.accounts.urls.user_urls")),
+    path("api/v1/friends/",     include("apps.friendships.urls")),
+    path("api/v1/conversations/", include("apps.messaging.urls")),
+    path("api/v1/calls/",       include("apps.calls.urls")),
+    path("api/v1/voice/",       include("apps.voice.urls")),
+
+    # ─── API Docs (disable in production via SPECTACULAR_SETTINGS) ────────────
+    path("api/schema/",         SpectacularAPIView.as_view(), name="schema"),
+    path("api/docs/",           SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/redoc/",          SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
+
+    # ─── Health Check ─────────────────────────────────────────────────────────
+    path("health/",             include("yaap.health")),
+]
+# ===== d:/yaap1/YAAP\backend\yaap\wsgi.py =====
+import os
+from django.core.wsgi import get_wsgi_application
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "yaap.settings")
+application = get_wsgi_application()
+# ===== d:/yaap1/YAAP\backend\yaap\__init__.py =====
+from .celery import app as celery_app
+
+__all__ = ("celery_app",)

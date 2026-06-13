@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 <!-- Base application theme -->
-<style name="Theme.Yaap" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+<style name="Theme.Yaap" parent="Theme.MaterialComponents.Light.NoActionBar">
     <item name="colorPrimary">@color/color_primary</item>
     <item name="colorPrimaryVariant">@color/color_primary_dark</item>
     <item name="colorSecondary">@color/color_secondary</item>
@@ -12,6 +12,9 @@
     <item name="android:fontFamily">@font/poppins_regular</item>
     <item name="android:statusBarColor">@color/color_primary</item>
     <item name="android:navigationBarColor">@color/white</item>
+    <item name="android:textColorPrimary">@color/color_dark_text</item>
+    <item name="android:textColorSecondary">@color/color_muted_text</item>
+    <item name="android:textColor">@color/color_dark_text</item>
 </style>
 
 <!-- Splash theme - no flicker -->
@@ -79,6 +82,8 @@
     <item name="boxCornerRadiusBottomEnd">4dp</item>
     <item name="boxStrokeColor">@color/color_border</item>
     <item name="hintTextColor">@color/color_muted_text</item>
+    <item name="editTextColor">@color/color_dark_text</item>
+    <item name="android:textColor">@color/color_dark_text</item>
 </style>
 
 <!-- ─── Text Styles ──────────────────────────────────── -->

@@ -15,6 +15,9 @@ interface ConversationDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(conversations: List<ConversationEntity>)
 
+    @Query("SELECT * FROM conversations WHERE id = :id")
+    suspend fun getById(id: String): ConversationEntity?
+
     @Query("DELETE FROM conversations WHERE id = :id")
     suspend fun delete(id: String)
 
@@ -24,7 +27,7 @@ interface ConversationDao {
 
 @Dao
 interface MessageDao {
-    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt DESC LIMIT 50")
+    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt ASC")
     fun observeMessages(conversationId: String): Flow<List<MessageEntity>>
 
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt DESC LIMIT :limit OFFSET :offset")

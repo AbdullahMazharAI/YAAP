@@ -1,0 +1,800 @@
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="List all accepted friends", tags=["Friendships"])
+    def get(self, request):
+        qs = Friendship.objects.filter(
+            Q(user_a=request.user) | Q(user_b=request.user)
+        ).select_related("user_a", "user_b")
+
+        serializer = FriendSerializer(qs, many=True, context={"request": request})
+        return _ok({"friends": serializer.data, "count": qs.count()})
+
+
+class FriendDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="Unfriend a user", tags=["Friendships"])
+    def delete(self, request, friendship_id):
+        try:
+            friendship = Friendship.objects.get(
+                Q(id=friendship_id) &
+                (Q(user_a=request.user) | Q(user_b=request.user))
+            )
+        except Friendship.DoesNotExist:
+            return _err("NOT_FOUND", "Friendship not found.", status.HTTP_404_NOT_FOUND)
+
+        friendship.delete()
+        logger.info("User %s unfriended via friendship %s", request.user.id, friendship_id)
+        return _ok({"message": "Friendship removed."})
+
+
+# ─── Send Friend Request ──────────────────────────────────────────────────────
+
+class SendFriendRequestView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=SendFriendRequestSerializer, summary="Send a friend request", tags=["Friendships"])
+    def post(self, request):
+        serializer = SendFriendRequestSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+
+        to_user = serializer.validated_data["to_user"]
+        message = serializer.validated_data.get("message", "")
+
+        friend_request = FriendRequest.objects.create(
+            from_user = request.user,
+            to_user   = to_user,
+            message   = message,
+        )
+
+        # Send FCM push to recipient (best-effort, non-blocking)
+        _push_friend_request(to_user, request.user.name, str(friend_request.id))
+
+        return _ok(
+            {"request": FriendRequestSerializer(friend_request).data},
+            status.HTTP_201_CREATED,
+        )
+
+
+def _push_friend_request(to_user, requester_name: str, request_id: str):
+    """Send FCM notification for friend request — ignores failures."""
+    try:
+        tokens = list(UserDevice.objects.filter(user=to_user).values_list("fcm_token", flat=True))
+        for token in tokens:
+            notify_friend_request(token, requester_name, request_id)
+    except Exception as e:
+        logger.warning("FCM friend request push failed: %s", e)
+
+
+# ─── Received Requests ────────────────────────────────────────────────────────
+
+class ReceivedFriendRequestsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="List incoming pending friend requests", tags=["Friendships"])
+    def get(self, request):
+        qs = (
+            FriendRequest.objects
+            .filter(to_user=request.user, status=FriendRequest.Status.PENDING)
+            .select_related("from_user")
+            .order_by("-created_at")
+        )
+        serializer = FriendRequestSerializer(qs, many=True)
+        return _ok({"requests": serializer.data, "count": qs.count()})
+
+
+# ─── Sent Requests ────────────────────────────────────────────────────────────
+
+class SentFriendRequestsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="List outgoing pending friend requests", tags=["Friendships"])
+    def get(self, request):
+        qs = (
+            FriendRequest.objects
+            .filter(from_user=request.user, status=FriendRequest.Status.PENDING)
+            .select_related("to_user")
+            .order_by("-created_at")
+        )
+        serializer = FriendRequestSerializer(qs, many=True)
+        return _ok({"requests": serializer.data, "count": qs.count()})
+
+
+# ─── Accept Friend Request ────────────────────────────────────────────────────
+
+class AcceptFriendRequestView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="Accept an incoming friend request", tags=["Friendships"])
+    def post(self, request, request_id):
+        try:
+            friend_request = FriendRequest.objects.select_related("from_user").get(
+                id      = request_id,
+                to_user = request.user,
+                status  = FriendRequest.Status.PENDING,
+            )
+        except FriendRequest.DoesNotExist:
+            return _err("NOT_FOUND", "Friend request not found or already handled.", status.HTTP_404_NOT_FOUND)
+
+        with transaction.atomic():
+            friend_request.accept()
+
+        logger.info(
+            "Friend request accepted: from=%s to=%s",
+            friend_request.from_user.id, request.user.id,
+        )
+
+        # Notify the original requester (best-effort)
+        try:
+            tokens = list(UserDevice.objects.filter(user=friend_request.from_user).values_list("fcm_token", flat=True))
+            from services.fcm_service import send_push
+            for token in tokens:
+                send_push(
+                    device_token      = token,
+                    title             = "Friend Request Accepted",
+                    body              = f"{request.user.name} accepted your friend request!",
+                    data              = {"type": "friend_accepted", "user_id": str(request.user.id)},
+                    notification_type = "friend_request",
+                )
+        except Exception as e:
+            logger.warning("FCM accept notification failed: %s", e)
+
+        return _ok({
+            "message":       "Friend request accepted.",
+            "friendship_id": str(
+                Friendship.objects.filter(
+                    Q(user_a=request.user, user_b=friend_request.from_user) |
+                    Q(user_a=friend_request.from_user, user_b=request.user)
+                ).values_list("id", flat=True).first()
+            ),
+        })
+
+
+# ─── Decline Friend Request ───────────────────────────────────────────────────
+
+class DeclineFriendRequestView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="Decline an incoming friend request", tags=["Friendships"])
+    def post(self, request, request_id):
+        try:
+            friend_request = FriendRequest.objects.get(
+                id      = request_id,
+                to_user = request.user,
+                status  = FriendRequest.Status.PENDING,
+            )
+        except FriendRequest.DoesNotExist:
+            return _err("NOT_FOUND", "Friend request not found.", status.HTTP_404_NOT_FOUND)
+
+        friend_request.decline()
+        logger.info("Friend request declined: id=%s", request_id)
+        return _ok({"message": "Friend request declined."})
+
+
+# ─── Cancel Friend Request ────────────────────────────────────────────────────
+
+class CancelFriendRequestView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="Cancel an outgoing friend request", tags=["Friendships"])
+    def delete(self, request, request_id):
+        try:
+            friend_request = FriendRequest.objects.get(
+                id        = request_id,
+                from_user = request.user,
+                status    = FriendRequest.Status.PENDING,
+            )
+        except FriendRequest.DoesNotExist:
+            return _err("NOT_FOUND", "Friend request not found.", status.HTTP_404_NOT_FOUND)
+
+        friend_request.cancel()
+        logger.info("Friend request cancelled: id=%s", request_id)
+        return _ok({"message": "Friend request cancelled."})
+
+
+# ─── Block User ───────────────────────────────────────────────────────────────
+
+class BlockUserView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(request=BlockUserSerializer, summary="Block a user", tags=["Friendships"])
+    def post(self, request):
+        serializer = BlockUserSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+
+        target_user = User.objects.get(id=serializer.validated_data["user_id"])
+
+        with transaction.atomic():
+            # Remove any existing friendship silently
+            Friendship.objects.unfriend(request.user, target_user)
+
+            # Cancel any pending requests between them
+            FriendRequest.objects.filter(
+                Q(from_user=request.user, to_user=target_user) |
+                Q(from_user=target_user, to_user=request.user),
+                status=FriendRequest.Status.PENDING,
+            ).update(status=FriendRequest.Status.CANCELLED)
+
+            # Create block
+            block = Block.objects.create(blocker=request.user, blocked=target_user)
+
+        logger.info("User %s blocked %s", request.user.id, target_user.id)
+        return _ok({"message": "User blocked.", "block_id": str(block.id)}, status.HTTP_201_CREATED)
+
+
+# ─── Unblock User ─────────────────────────────────────────────────────────────
+
+class UnblockUserView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="Unblock a user", tags=["Friendships"])
+    def delete(self, request, user_id):
+        deleted, _ = Block.objects.filter(blocker=request.user, blocked_id=user_id).delete()
+        if not deleted:
+            return _err("NOT_FOUND", "Block record not found.", status.HTTP_404_NOT_FOUND)
+        logger.info("User %s unblocked %s", request.user.id, user_id)
+        return _ok({"message": "User unblocked."})
+
+# ─── Blocked Users List ───────────────────────────────────────────────────────
+
+class BlockedUsersView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="List all blocked users", tags=["Friendships"])
+    def get(self, request):
+        blocks = (
+            Block.objects
+            .filter(blocker=request.user)
+            .select_related("blocked")
+            .order_by("-created_at")
+        )
+        serializer = BlockSerializer(blocks, many=True)
+        return _ok({"blocked": serializer.data, "count": blocks.count()})
+
+
+# ─── FCM Device Registration ──────────────────────────────────────────────────
+
+class RegisterDeviceView(APIView):
+    """
+    Called by the Kotlin app on startup and after FCM token refresh.
+    Stores the token so the server can push notifications to this device.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        request=RegisterDeviceSerializer,
+        summary="Register FCM device token for push notifications",
+        tags=["Devices"],
+    )
+    def post(self, request):
+        serializer = RegisterDeviceSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        device = serializer.save()
+        return _ok({"device_id": str(device.id), "message": "Device registered."}, status.HTTP_201_CREATED)
+
+    @extend_schema(summary="Remove a device token (e.g. on logout)", tags=["Devices"])
+    def delete(self, request):
+        token = request.data.get("fcm_token")
+        if not token:
+            return _err("MISSING_TOKEN", "fcm_token is required.")
+        UserDevice.objects.filter(user=request.user, fcm_token=token).delete()
+        return _ok({"message": "Device token removed."})
+
+
+# ─── Friend Suggestion (Mutual Friends) ──────────────────────────────────────
+
+class FriendSuggestionsView(APIView):
+    """
+    Returns up to 20 users who share mutual friends with the requesting user
+    but are not yet friends. Simple heuristic: sorted by mutual friend count.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(summary="Get friend suggestions based on mutual connections", tags=["Friendships"])
+    def get(self, request):
+        from apps.friendships.models import Friendship as F
+        user        = request.user
+        friend_ids  = set(F.objects.get_friends(user).values_list("id", flat=True))
+        blocked_ids = set(Block.objects.blocked_user_ids(user))
+        exclude_ids = friend_ids | blocked_ids | {user.id}
+
+        # Find friends-of-friends
+        fof_ids = set()
+        for fid in friend_ids:
+            try:
+                friend_obj = User.objects.get(id=fid)
+                fof        = F.objects.get_friends(friend_obj).values_list("id", flat=True)
+                fof_ids.update(fof)
+            except Exception:
+                continue
+
+        candidates = fof_ids - exclude_ids
+        if not candidates:
+            return _ok({"suggestions": [], "count": 0})
+
+        # Sort by mutual friend count (descending), take top 20
+        from apps.accounts.serializers import UserSearchSerializer
+        candidate_users = User.objects.filter(id__in=candidates, is_active=True)[:50]
+        scored = sorted(
+            candidate_users,
+            key=lambda u: F.objects.mutual_friends_count(user, u),
+            reverse=True,
+        )[:20]
+
+        serializer = UserSearchSerializer(scored, many=True, context={"request": request})
+        return _ok({"suggestions": serializer.data, "count": len(scored)})
+# ===== d:/yaap1/YAAP\backend\apps\friendships\tests\test_friendships.py =====
+"""
+Friendship endpoint tests — Phase 2.
+Covers: send request, accept, decline, cancel, unfriend, block, suggestions.
+"""
+
+import pytest
+from django.utils import timezone
+from datetime import timedelta
+
+from apps.friendships.models import Block, FriendRequest, Friendship
+
+
+def make_friendship(user_a, user_b):
+    """Test helper: create an accepted friendship directly."""
+    req = FriendRequest.objects.create(
+        from_user  = user_a,
+        to_user    = user_b,
+        expires_at = timezone.now() + timedelta(days=1) if hasattr(FriendRequest, "expires_at") else None,
+    )
+    req.accept()
+    return Friendship.objects.filter(
+        __import__("django.db.models", fromlist=["Q"]).Q(user_a=user_a, user_b=user_b) |
+        __import__("django.db.models", fromlist=["Q"]).Q(user_a=user_b, user_b=user_a)
+    ).first()
+
+
+# ─── Send Friend Request ──────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestSendFriendRequest:
+
+    URL = "/api/v1/friends/request/"
+
+    def test_send_request_success(self, auth_client, user_b):
+        client, user = auth_client
+        resp = client.post(self.URL, {"to_user_id": str(user_b.id)})
+        assert resp.status_code == 201
+        assert resp.json()["success"] is True
+        assert FriendRequest.objects.filter(from_user=user, to_user=user_b, status="pending").exists()
+
+    def test_cannot_send_to_self(self, auth_client):
+        client, user = auth_client
+        resp = client.post(self.URL, {"to_user_id": str(user.id)})
+        assert resp.status_code == 400
+
+    def test_cannot_send_duplicate_pending(self, auth_client, user_b):
+        client, user = auth_client
+        FriendRequest.objects.create(from_user=user, to_user=user_b)
+        resp = client.post(self.URL, {"to_user_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    def test_cannot_send_to_already_friend(self, auth_client, user_b):
+        client, user = auth_client
+        FriendRequest.objects.create(from_user=user, to_user=user_b).accept()
+        resp = client.post(self.URL, {"to_user_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    def test_cannot_send_to_blocked_user(self, auth_client, user_b):
+        client, user = auth_client
+        Block.objects.create(blocker=user, blocked=user_b)
+        resp = client.post(self.URL, {"to_user_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    def test_cooldown_after_decline(self, auth_client, user_b):
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user, to_user=user_b)
+        req.decline()
+        # Try immediately — should be blocked by cooldown
+        resp = client.post(self.URL, {"to_user_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    def test_unauthenticated_rejected(self, api_client, user_b):
+        resp = api_client.post(self.URL, {"to_user_id": str(user_b.id)})
+        assert resp.status_code == 401
+
+
+# ─── Received Requests ────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestReceivedRequests:
+
+    URL = "/api/v1/friends/requests/received/"
+
+    def test_lists_incoming_pending(self, auth_client, user_b):
+        client, user = auth_client
+        FriendRequest.objects.create(from_user=user_b, to_user=user)
+        resp = client.get(self.URL)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["count"] == 1
+        assert data["requests"][0]["from_user"]["id"] == str(user_b.id)
+
+    def test_does_not_show_accepted(self, auth_client, user_b):
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user)
+        req.accept()
+        resp = client.get(self.URL)
+        assert resp.json()["data"]["count"] == 0
+
+
+# ─── Accept Request ───────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestAcceptFriendRequest:
+
+    def test_accept_creates_friendship(self, auth_client, user_b, mocker):
+        mocker.patch("apps.friendships.views.UserDevice")
+        mocker.patch("apps.friendships.views.send_push")
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user)
+        url = f"/api/v1/friends/requests/{req.id}/accept/"
+        resp = client.post(url)
+        assert resp.status_code == 200
+        req.refresh_from_db()
+        assert req.status == "accepted"
+        assert Friendship.objects.are_friends(user, user_b)
+
+    def test_cannot_accept_others_request(self, auth_client, user_b, user_c):
+        client, user = auth_client
+        # Request between user_b and user_c — user should not be able to accept
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user_c)
+        url = f"/api/v1/friends/requests/{req.id}/accept/"
+        resp = client.post(url)
+        assert resp.status_code == 404
+
+
+# ─── Decline Request ──────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestDeclineFriendRequest:
+
+    def test_decline_sets_status(self, auth_client, user_b):
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user)
+        url = f"/api/v1/friends/requests/{req.id}/decline/"
+        resp = client.post(url)
+        assert resp.status_code == 200
+        req.refresh_from_db()
+        assert req.status == "declined"
+        assert not Friendship.objects.are_friends(user, user_b)
+
+
+# ─── Cancel Sent Request ──────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestCancelFriendRequest:
+
+    def test_cancel_own_request(self, auth_client, user_b):
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user, to_user=user_b)
+        url = f"/api/v1/friends/requests/{req.id}/"
+        resp = client.delete(url)
+        assert resp.status_code == 200
+        req.refresh_from_db()
+        assert req.status == "cancelled"
+
+    def test_cannot_cancel_others_request(self, auth_client, user_b, user_c):
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user_c)
+        url = f"/api/v1/friends/requests/{req.id}/"
+        resp = client.delete(url)
+        assert resp.status_code == 404
+
+
+# ─── Unfriend ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestUnfriend:
+
+    def test_unfriend_removes_friendship(self, auth_client, user_b, mocker):
+        mocker.patch("apps.friendships.views.UserDevice")
+        mocker.patch("apps.friendships.views.send_push")
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user)
+        req.accept()
+        friendship = Friendship.objects.filter(
+            __import__("django.db.models", fromlist=["Q"]).Q(user_a=user, user_b=user_b) |
+            __import__("django.db.models", fromlist=["Q"]).Q(user_a=user_b, user_b=user)
+        ).first()
+        url = f"/api/v1/friends/{friendship.id}/"
+        resp = client.delete(url)
+        assert resp.status_code == 200
+        assert not Friendship.objects.are_friends(user, user_b)
+
+    def test_cannot_delete_others_friendship(self, auth_client, user_b, user_c):
+        client, user = auth_client
+        req = FriendRequest.objects.create(from_user=user_b, to_user=user_c)
+        req.accept()
+        from django.db.models import Q
+        friendship = Friendship.objects.filter(Q(user_a=user_b) | Q(user_b=user_b)).first()
+        url = f"/api/v1/friends/{friendship.id}/"
+        resp = client.delete(url)
+        assert resp.status_code == 404
+
+
+# ─── Block ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestBlock:
+
+    BLOCK_URL = "/api/v1/friends/block/"
+
+    def test_block_user(self, auth_client, user_b):
+        client, user = auth_client
+        resp = client.post(self.BLOCK_URL, {"user_id": str(user_b.id)})
+        assert resp.status_code == 201
+        assert Block.objects.is_blocked(user, user_b)
+
+    def test_block_removes_friendship(self, auth_client, user_b, mocker):
+        mocker.patch("apps.friendships.views.UserDevice")
+        mocker.patch("apps.friendships.views.send_push")
+        client, user = auth_client
+        FriendRequest.objects.create(from_user=user_b, to_user=user).accept()
+        assert Friendship.objects.are_friends(user, user_b)
+        client.post(self.BLOCK_URL, {"user_id": str(user_b.id)})
+        assert not Friendship.objects.are_friends(user, user_b)
+
+    def test_cannot_block_self(self, auth_client):
+        client, user = auth_client
+        resp = client.post(self.BLOCK_URL, {"user_id": str(user.id)})
+        assert resp.status_code == 400
+
+    def test_cannot_double_block(self, auth_client, user_b):
+        client, user = auth_client
+        Block.objects.create(blocker=user, blocked=user_b)
+        resp = client.post(self.BLOCK_URL, {"user_id": str(user_b.id)})
+        assert resp.status_code == 400
+
+    def test_unblock_user(self, auth_client, user_b):
+        client, user = auth_client
+        Block.objects.create(blocker=user, blocked=user_b)
+        resp = client.delete(f"/api/v1/friends/block/{user_b.id}/")
+        assert resp.status_code == 200
+        assert not Block.objects.is_blocked(user, user_b)
+
+    def test_blocked_user_not_in_search(self, auth_client, user_b):
+        client, user = auth_client
+        Block.objects.create(blocker=user, blocked=user_b)
+        resp = client.get(f"/api/v1/users/search/?q={user_b.display_name}")
+        results = resp.json()["data"]["results"]
+        ids = [r["id"] for r in results]
+        assert str(user_b.id) not in ids
+# ===== d:/yaap1/YAAP\backend\apps\friendships\tests\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\apps\messaging\admin.py =====
+from django.contrib import admin
+from .models import Conversation, Message, MessageTranslation, MessageDeletion
+
+@admin.register(Conversation)
+class ConversationAdmin(admin.ModelAdmin):
+    list_display = ["id", "participant_a", "participant_b", "updated_at"]
+    search_fields = ["participant_a__email", "participant_b__email"]
+
+@admin.register(Message)
+class MessageAdmin(admin.ModelAdmin):
+    list_display = ["id", "sender", "conversation", "status", "deleted_for_everyone", "created_at"]
+    list_filter  = ["status", "deleted_for_everyone"]
+    search_fields = ["sender__email", "content"]
+
+@admin.register(MessageTranslation)
+class MessageTranslationAdmin(admin.ModelAdmin):
+    list_display = ["message", "language", "created_at"]
+    list_filter  = ["language"]
+# ===== d:/yaap1/YAAP\backend\apps\messaging\apps.py =====
+from django.apps import AppConfig
+
+class MessagingConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "apps.messaging"
+    verbose_name = "Messaging"
+# ===== d:/yaap1/YAAP\backend\apps\messaging\models.py =====
+"""
+Messaging Models — Conversation, Message, MessageDeletion, MessageTranslation
+"""
+import uuid
+from django.conf import settings
+from django.db import models
+from django.db.models import Q
+from django.utils import timezone
+
+
+class ConversationManager(models.Manager):
+    def get_or_create_between(self, user_a, user_b):
+        a, b = _ordered_users(user_a, user_b)
+        return self.get_or_create(participant_a=a, participant_b=b)
+
+    def for_user(self, user):
+        return (
+            self.filter(Q(participant_a=user) | Q(participant_b=user))
+            .select_related("participant_a", "participant_b", "last_message")
+            .order_by("-updated_at")
+        )
+
+
+class Conversation(models.Model):
+    id            = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    participant_a = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conversations_as_a")
+    participant_b = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="conversations_as_b")
+    last_message  = models.ForeignKey("Message", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    created_at    = models.DateTimeField(auto_now_add=True)
+    updated_at    = models.DateTimeField(auto_now=True)
+    objects       = ConversationManager()
+
+    class Meta:
+        db_table        = "conversations"
+        unique_together = [("participant_a", "participant_b")]
+        indexes         = [models.Index(fields=["-updated_at"])]
+
+    def save(self, *args, **kwargs):
+        if str(self.participant_a_id) > str(self.participant_b_id):
+            self.participant_a_id, self.participant_b_id = self.participant_b_id, self.participant_a_id
+        super().save(*args, **kwargs)
+
+    def other_participant(self, user):
+        return self.participant_b if self.participant_a_id == user.id else self.participant_a
+
+
+class MessageManager(models.Manager):
+    def visible_to(self, user, conversation):
+        deleted_for_me = MessageDeletion.objects.filter(user=user).values_list("message_id", flat=True)
+        return (
+            self.filter(conversation=conversation, deleted_for_everyone=False)
+            .exclude(id__in=deleted_for_me)
+            .select_related("sender")
+            .order_by("-created_at")
+        )
+
+
+class Message(models.Model):
+    class Status(models.TextChoices):
+        SENT      = "sent",      "Sent"
+        DELIVERED = "delivered", "Delivered"
+        READ      = "read",      "Read"
+
+    id                   = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation         = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="messages")
+    sender               = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sent_messages")
+    content              = models.TextField()
+    original_language    = models.CharField(max_length=5, default="en")
+    status               = models.CharField(max_length=10, choices=Status.choices, default=Status.SENT, db_index=True)
+    deleted_for_everyone = models.BooleanField(default=False, db_index=True)
+    deleted_at           = models.DateTimeField(null=True, blank=True)
+    created_at           = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at           = models.DateTimeField(auto_now=True)
+    objects              = MessageManager()
+
+    class Meta:
+        db_table = "messages"
+        indexes  = [models.Index(fields=["conversation", "-created_at"])]
+
+    def can_delete_for_everyone(self, user) -> bool:
+        if self.sender_id != user.id:
+            return False
+        hours_elapsed = (timezone.now() - self.created_at).total_seconds() / 3600
+        return hours_elapsed <= settings.YAAP_MESSAGE_DELETE_WINDOW_HOURS
+
+    def delete_for_everyone(self):
+        self.deleted_for_everyone = True
+        self.content              = "This message was deleted."
+        self.deleted_at           = timezone.now()
+        self.save(update_fields=["deleted_for_everyone", "content", "deleted_at"])
+
+    def delete_for_user(self, user):
+        MessageDeletion.objects.get_or_create(message=self, user=user)
+
+
+#class MessageDeletion(models.Model):
+   # message    = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="deletions")
+    #user       = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    #deleted_at = models.DateTimeField(auto_now_add=True)
+
+    #class Meta:
+     #   db_table        = "message_deletions"
+      #  unique_together = [("message", "user")]
+
+
+
+class MessageDeletion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)  
+    message = models.ForeignKey("messaging.Message", on_delete=models.CASCADE)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    deleted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["message", "user"], name="unique_message_deletion")
+        ]
+
+
+
+class MessageTranslation(models.Model):
+    id                 = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    message            = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="translations")
+    language           = models.CharField(max_length=5)
+    translated_content = models.TextField()
+    created_at         = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table        = "message_translations"
+        unique_together = [("message", "language")]
+        indexes         = [models.Index(fields=["message", "language"])]
+
+
+def _ordered_users(user_a, user_b):
+    if str(user_a.id) <= str(user_b.id):
+        return user_a, user_b
+    return user_b, user_a
+# ===== d:/yaap1/YAAP\backend\apps\messaging\serializers.py =====
+"""Messaging Serializers"""
+from django.conf import settings
+from rest_framework import serializers
+from .models import Conversation, Message, MessageTranslation
+
+
+class MessageSerializer(serializers.ModelSerializer):
+    sender_id    = serializers.UUIDField(source="sender.id",        read_only=True)
+    sender_name  = serializers.CharField(source="sender.name",       read_only=True)
+    sender_avatar = serializers.CharField(source="sender.avatar_url", read_only=True)
+    translation  = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = Message
+        fields = ["id","conversation_id","sender_id","sender_name","sender_avatar",
+                  "content","original_language","status","deleted_for_everyone",
+                  "translation","created_at","updated_at"]
+
+    def get_translation(self, obj):
+        lang = self.context.get("preferred_language")
+        if not lang or lang == obj.original_language or obj.deleted_for_everyone:
+            return None
+        t = obj.translations.filter(language=lang).first()
+        return t.translated_content if t else None
+
+
+class ConversationSerializer(serializers.ModelSerializer):
+    other_user   = serializers.SerializerMethodField()
+    last_message = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = Conversation
+        fields = ["id","other_user","last_message","unread_count","created_at","updated_at"]
+
+    def get_other_user(self, obj):
+        user  = self.context["request"].user
+        other = obj.other_participant(user)
+        return {
+            "id": str(other.id), "display_name": other.name,
+            "avatar_url": other.avatar_url, "country_code": other.country_code,
+            "timezone": other.timezone, "is_online": other.is_online,
+            "last_seen": other.last_seen.isoformat() if other.last_seen else None,
+        }
+
+    def get_last_message(self, obj):
+        if not obj.last_message or obj.last_message.deleted_for_everyone:
+            return None
+        m = obj.last_message
+        return {"id": str(m.id), "content": m.content, "sender_id": str(m.sender_id),
+                "status": m.status, "created_at": m.created_at.isoformat()}
+
+    def get_unread_count(self, obj):
+        user = self.context["request"].user
+        return Message.objects.filter(
+            conversation=obj, deleted_for_everyone=False,
+        ).exclude(sender=user).exclude(status=Message.Status.READ).count()
+
+
+class TranslateMessageSerializer(serializers.Serializer):
+    language = serializers.ChoiceField(choices=settings.YAAP_SUPPORTED_LANGUAGES)
+# ===== d:/yaap1/YAAP\backend\apps\messaging\urls.py =====
+from django.urls import path
+from .views import ConversationListView, ConversationDetailView, MessageListView, TranslateMessageView, DeleteMessageView
+
+urlpatterns = [
+    path("",                                          ConversationListView.as_view(),   name="conversation-list"),

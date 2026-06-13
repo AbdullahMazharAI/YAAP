@@ -23,6 +23,8 @@ class ChatRepository @Inject constructor(
 ) {
     fun observeConversations(): Flow<List<ConversationEntity>> = conversationDao.observeAll()
 
+    suspend fun getConversation(id: String): ConversationEntity? = conversationDao.getById(id)
+
     suspend fun refreshConversations(): Result<List<Conversation>> {
         // Unwrap envelope → get ConversationsDataResponse → extract conversations list
         val result = safeApiCall { api.getConversations() }

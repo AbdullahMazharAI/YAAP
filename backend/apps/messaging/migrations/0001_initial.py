@@ -46,6 +46,7 @@ class Migration(migrations.Migration):
         migrations.CreateModel(
             name="MessageDeletion",
             fields=[
+                ("id",         models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False, serialize=False)),
                 ("message",    models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="deletions", to="messaging.message")),
                 ("user",       models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to=settings.AUTH_USER_MODEL)),
                 ("deleted_at", models.DateTimeField(auto_now_add=True)),

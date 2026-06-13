@@ -1,0 +1,800 @@
+            .show()
+    }
+
+    private fun navigateToMain() {
+        startActivity(Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        })
+        finish()
+    }
+
+    override fun onDestroy() {
+        mediaPlayer?.release()
+        super.onDestroy()
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\onboarding\VoiceTrainingViewModel.kt =====
+package com.yaap.app.ui.onboarding
+
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.yaap.app.data.repository.VoiceRepository
+import com.yaap.app.model.VoiceSentence
+import com.yaap.app.utils.Constants
+import com.yaap.app.utils.Result
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import javax.inject.Inject
+
+sealed class VoiceTrainingState {
+    object Loading : VoiceTrainingState()
+    data class Ready(val sentences: List<VoiceSentence>, val currentIndex: Int) : VoiceTrainingState()
+    object Recording : VoiceTrainingState()
+    data class Recorded(val audioFile: File) : VoiceTrainingState()
+    object Uploading : VoiceTrainingState()
+    object Training : VoiceTrainingState()
+    object Complete : VoiceTrainingState()
+    data class Error(val message: String) : VoiceTrainingState()
+}
+
+@HiltViewModel
+class VoiceTrainingViewModel @Inject constructor(
+    private val repo: VoiceRepository
+) : ViewModel() {
+
+    private val _state = MutableStateFlow<VoiceTrainingState>(VoiceTrainingState.Loading)
+    val state: StateFlow<VoiceTrainingState> = _state.asStateFlow()
+
+    private val _amplitude = MutableStateFlow(0)
+    val amplitude: StateFlow<Int> = _amplitude.asStateFlow()
+
+    private val _noiseWarning = MutableSharedFlow<Unit>()
+    val noiseWarning: SharedFlow<Unit> = _noiseWarning
+
+    var sentences: List<VoiceSentence> = emptyList()
+    var currentIndex = 0
+    val uploadedIndices = mutableSetOf<Int>()
+
+    private var audioRecord: AudioRecord? = null
+    private var recordingJob: Job? = null
+    private var tempAudioFile: File? = null
+    private val audioBuffer = ByteArrayOutputStream()
+
+    fun loadSentences() {
+        viewModelScope.launch {
+            _state.value = VoiceTrainingState.Loading
+            when (val result = repo.getSentences()) {
+                is Result.Success -> {
+                    sentences = result.data.sentences
+                    _state.value = VoiceTrainingState.Ready(sentences, currentIndex)
+                }
+                is Result.Error -> _state.value = VoiceTrainingState.Error(result.message)
+                else -> {}
+            }
+        }
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    fun startRecording(cacheDir: File) {
+        val bufferSize = maxOf(
+            AudioRecord.getMinBufferSize(Constants.AUDIO_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT),
+            Constants.AUDIO_FRAME_SIZE
+        )
+        audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            Constants.AUDIO_SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            bufferSize
+        )
+        audioBuffer.reset()
+        audioRecord?.startRecording()
+        _state.value = VoiceTrainingState.Recording
+
+        recordingJob = viewModelScope.launch(Dispatchers.IO) {
+            val buffer = ShortArray(Constants.AUDIO_FRAME_SIZE / 2)
+            val byteBuffer = ByteBuffer.allocate(Constants.AUDIO_FRAME_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+            var elapsed = 0
+            while (isActive && elapsed < Constants.MAX_RECORDING_SECONDS * 1000) {
+                val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
+                if (read > 0) {
+                    byteBuffer.clear()
+                    for (i in 0 until read) byteBuffer.putShort(buffer[i])
+                    audioBuffer.write(byteBuffer.array(), 0, read * 2)
+                    val maxAmp = buffer.take(read).maxOrNull()?.toInt() ?: 0
+                    _amplitude.value = maxAmp
+                    elapsed += (read * 1000 / Constants.AUDIO_SAMPLE_RATE)
+                }
+            }
+            // Auto-stop after max time
+            withContext(Dispatchers.Main) { stopRecording(cacheDir) }
+        }
+    }
+
+    fun stopRecording(cacheDir: File) {
+        recordingJob?.cancel()
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+        _amplitude.value = 0
+
+        val pcmData = audioBuffer.toByteArray()
+        if (pcmData.size < 16000) { // less than 0.5s
+            _state.value = VoiceTrainingState.Error("Recording too short. Please speak the full sentence.")
+            _state.value = VoiceTrainingState.Ready(sentences, currentIndex)
+            return
+        }
+
+        val file = File(cacheDir, "voice_sample_$currentIndex.wav")
+        writeWav(file, pcmData)
+        tempAudioFile = file
+        _state.value = VoiceTrainingState.Recorded(file)
+    }
+
+    fun acceptRecording() {
+        val file = tempAudioFile ?: return
+        val sentence = sentences.getOrNull(currentIndex) ?: return
+
+        viewModelScope.launch {
+            _state.value = VoiceTrainingState.Uploading
+            val requestBody = file.readBytes().toRequestBody("audio/wav".toMediaType())
+            val part = MultipartBody.Part.createFormData("audio", file.name, requestBody)
+
+            when (val result = repo.uploadSample(part, currentIndex, sentence.id)) {
+                is Result.Success -> {
+                    if (result.data.noiseWarning) _noiseWarning.emit(Unit)
+                    uploadedIndices.add(currentIndex)
+                    currentIndex++
+                    if (currentIndex >= sentences.size) {
+                        trainVoice()
+                    } else {
+                        _state.value = VoiceTrainingState.Ready(sentences, currentIndex)
+                    }
+                }
+                is Result.Error -> {
+                    _state.value = VoiceTrainingState.Error(result.message)
+                    _state.value = VoiceTrainingState.Ready(sentences, currentIndex)
+                }
+                else -> {}
+            }
+        }
+    }
+
+    fun reRecord(cacheDir: File) {
+        viewModelScope.launch {
+            if (uploadedIndices.contains(currentIndex)) {
+                repo.deleteSample(currentIndex)
+                uploadedIndices.remove(currentIndex)
+            }
+            tempAudioFile?.delete()
+            tempAudioFile = null
+            _state.value = VoiceTrainingState.Ready(sentences, currentIndex)
+        }
+    }
+
+    private fun trainVoice() {
+        viewModelScope.launch {
+            _state.value = VoiceTrainingState.Training
+            repo.trainVoice()
+            // Completion is signaled via presence WebSocket (voice.training_update)
+            // Poll as fallback
+            pollTrainingStatus()
+        }
+    }
+
+    private suspend fun pollTrainingStatus() {
+        repeat(60) { // poll up to 5 minutes
+            delay(5000)
+            when (val result = repo.getVoiceStatus()) {
+                is Result.Success -> {
+                    if (result.data.voiceTrained) {
+                        _state.value = VoiceTrainingState.Complete
+                        return
+                    }
+                }
+                else -> {}
+            }
+        }
+        _state.value = VoiceTrainingState.Error("Training timed out. Please try again.")
+    }
+
+    private fun writeWav(file: File, pcmData: ByteArray) {
+        val totalDataLen = pcmData.size + 36
+        val byteRate = Constants.AUDIO_SAMPLE_RATE * 2
+        FileOutputStream(file).use { out ->
+            fun writeInt(value: Int) = out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array())
+            fun writeShort(value: Short) = out.write(ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(value).array())
+            out.write("RIFF".toByteArray())
+            writeInt(totalDataLen)
+            out.write("WAVE".toByteArray())
+            out.write("fmt ".toByteArray())
+            writeInt(16)
+            writeShort(1)  // PCM
+            writeShort(1)  // mono
+            writeInt(Constants.AUDIO_SAMPLE_RATE)
+            writeInt(byteRate)
+            writeShort(2)  // block align
+            writeShort(16) // bits per sample
+            out.write("data".toByteArray())
+            writeInt(pcmData.size)
+            out.write(pcmData)
+        }
+    }
+
+    override fun onCleared() {
+        audioRecord?.release()
+        super.onCleared()
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\settings\SettingsFragment.kt =====
+package com.yaap.app.ui.settings
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.viewModelScope
+import com.yaap.app.data.api.WebSocketManager
+import com.yaap.app.data.repository.AuthRepository
+import com.yaap.app.data.repository.UserRepository
+import com.yaap.app.databinding.FragmentSettingsBinding
+import com.yaap.app.model.User
+import com.yaap.app.ui.auth.AuthActivity
+import com.yaap.app.utils.Result
+import com.yaap.app.utils.loadAvatar
+import dagger.hilt.android.AndroidEntryPoint
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+// ────────────────────────────────────────────────────────────────────
+//  SettingsViewModel
+// ────────────────────────────────────────────────────────────────────
+@HiltViewModel
+class SettingsViewModel @Inject constructor(
+    private val userRepo: UserRepository,
+    private val authRepo: AuthRepository,
+    private val wsManager: WebSocketManager
+) : ViewModel() {
+
+    private val _profile = MutableStateFlow<User?>(null)
+    val profile: StateFlow<User?> = _profile.asStateFlow()
+
+    private val _logoutState = MutableStateFlow<Result<*>>(Result.Idle)
+    val logoutState: StateFlow<Result<*>> = _logoutState.asStateFlow()
+
+    init { loadProfile() }
+
+    fun loadProfile() = viewModelScope.launch {
+        when (val r = userRepo.getMyProfile()) {
+            is Result.Success -> _profile.value = r.data
+            else -> {}
+        }
+    }
+
+    fun logout() = viewModelScope.launch {
+        _logoutState.value = Result.Loading
+        authRepo.logout()
+        authRepo.clearTokens()
+        wsManager.disconnect()
+        _logoutState.value = Result.Success(Unit)
+    }
+
+    fun updatePrivacy(lastSeenMode: String? = null, readReceipts: Boolean? = null, onlineStatus: Boolean? = null) {
+        viewModelScope.launch {
+            // PATCH /users/me/ with privacy fields — build request from non-null params
+            // For now, call updateProfile with current values; extend UpdateProfileRequest as needed
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  SettingsFragment
+// ────────────────────────────────────────────────────────────────────
+@AndroidEntryPoint
+class SettingsFragment : Fragment() {
+
+    private var _binding: FragmentSettingsBinding? = null
+    private val binding get() = _binding!!
+    private val viewModel: SettingsViewModel by viewModels()
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, s: Bundle?): View {
+        _binding = FragmentSettingsBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        observeProfile()
+        setupClickListeners()
+        observeLogout()
+    }
+
+    private fun observeProfile() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.profile.collect { user ->
+                user ?: return@collect
+                binding.ivAvatar.loadAvatar(user.avatarUrl, user.displayName.take(1))
+                binding.tvDisplayName.text = user.displayName
+                binding.tvEmail.text = user.email
+                binding.tvAppVersion.text = "YAAP v${com.yaap.app.BuildConfig.VERSION_NAME}"
+            }
+        }
+    }
+
+    private fun setupClickListeners() {
+        binding.rowEditName.setOnClickListener { showEditNameDialog() }
+        binding.rowEditBio.setOnClickListener { showEditBioDialog() }
+        binding.rowChangeLanguage.setOnClickListener {
+            startActivity(android.content.Intent(requireContext(), com.yaap.app.ui.onboarding.LanguageSelectionActivity::class.java))
+        }
+        binding.rowReRecordVoice.setOnClickListener {
+            startActivity(android.content.Intent(requireContext(), com.yaap.app.ui.onboarding.VoiceTrainingActivity::class.java))
+        }
+        binding.switchReadReceipts.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePrivacy(readReceipts = isChecked)
+        }
+        binding.switchOnlineStatus.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.updatePrivacy(onlineStatus = isChecked)
+        }
+        binding.btnLogout.setOnClickListener { showLogoutConfirmation() }
+    }
+
+    private fun showLogoutConfirmation() {
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(requireContext())
+            .setTitle("Log Out")
+            .setMessage("Are you sure you want to log out?")
+            .setPositiveButton("Log Out") { _, _ -> viewModel.logout() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showEditNameDialog() {
+        val input = android.widget.EditText(requireContext()).apply {
+            setText(viewModel.profile.value?.displayName)
+            hint = "Display name"
+        }
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(requireContext())
+            .setTitle("Edit Name")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val newName = input.text.toString().trim()
+                if (newName.length >= 2) {
+                    viewLifecycleOwner.lifecycleScope.launch {
+                        // call PATCH /users/me/ with new displayName
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showEditBioDialog() {
+        val input = android.widget.EditText(requireContext()).apply {
+            setText(viewModel.profile.value?.bio)
+            hint = "Bio (max 160 characters)"
+            filters = arrayOf(android.text.InputFilter.LengthFilter(160))
+        }
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(requireContext())
+            .setTitle("Edit Bio")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ -> /* PATCH /users/me/ with bio */ }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun observeLogout() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.logoutState.collect { state ->
+                when (state) {
+                    is Result.Success<*> -> {
+                        startActivity(Intent(requireContext(), AuthActivity::class.java).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                        })
+                    }
+                    is Result.Error -> {
+                        com.google.android.material.snackbar.Snackbar
+                            .make(binding.root, state.message, com.google.android.material.snackbar.Snackbar.LENGTH_SHORT).show()
+                    }
+                    else -> {}
+                }
+            }
+        }
+    }
+
+    override fun onDestroyView() { super.onDestroyView(); _binding = null }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\ui\splash\SplashActivity.kt =====
+package com.yaap.app.ui.splash
+
+import android.annotation.SuppressLint
+import android.content.Intent
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import com.yaap.app.R
+import com.yaap.app.ui.auth.AuthActivity
+import com.yaap.app.ui.main.MainActivity
+import com.yaap.app.ui.onboarding.LanguageSelectionActivity
+import com.yaap.app.ui.onboarding.PersonalDetailsActivity
+import com.yaap.app.ui.onboarding.VoiceTrainingActivity
+import com.yaap.app.utils.Constants
+import com.yaap.app.utils.TokenManager
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@SuppressLint("CustomSplashScreen")
+@AndroidEntryPoint
+class SplashActivity : AppCompatActivity() {
+
+    @Inject lateinit var tokenManager: TokenManager
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_splash)
+
+        lifecycleScope.launch {
+            delay(500) // 500ms logo display
+            route()
+        }
+    }
+
+    private fun route() {
+        if (!tokenManager.hasValidToken()) {
+            goTo(AuthActivity::class.java)
+            return
+        }
+
+        val claims = tokenManager.decodeJwtClaims()
+        val destination = when (claims?.nextStep) {
+            Constants.STEP_PERSONAL_DETAILS -> PersonalDetailsActivity::class.java
+            Constants.STEP_LANGUAGE_SELECTION -> LanguageSelectionActivity::class.java
+            Constants.STEP_VOICE_TRAINING -> VoiceTrainingActivity::class.java
+            else -> MainActivity::class.java
+        }
+        goTo(destination)
+    }
+
+    private fun <T> goTo(cls: Class<T>) {
+        startActivity(
+            Intent(this, cls).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            }
+        )
+        finish()
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\utils\Constants.kt =====
+package com.yaap.app.utils
+
+import com.yaap.app.BuildConfig
+
+object Constants {
+    // API
+    const val BASE_URL = BuildConfig.BASE_URL
+    const val WS_BASE_URL = BuildConfig.WS_BASE_URL
+    const val API_V1 = "/api/v1"
+
+    // Prefs keys
+    const val PREF_ACCESS_TOKEN = "access_token"
+    const val PREF_REFRESH_TOKEN = "refresh_token"
+    const val PREF_USER_ID = "user_id"
+    const val PREF_DISPLAY_NAME = "display_name"
+    const val PREF_LANGUAGE_PREF = "language_preference"
+    const val PREF_VOICE_TRAINED = "voice_trained"
+    const val PREF_PROFILE_COMPLETE = "profile_complete"
+
+    // Intent extras
+    const val EXTRA_CONVERSATION_ID = "conversation_id"
+    const val EXTRA_ROOM_ID = "room_id"
+    const val EXTRA_CALLER_NAME = "caller_name"
+    const val EXTRA_CALLER_AVATAR = "caller_avatar"
+    const val EXTRA_IS_INCOMING = "is_incoming"
+    const val EXTRA_FRIEND_ID = "friend_id"
+    const val EXTRA_FRIENDSHIP_TAB = "friendship_tab"
+
+    // Notification channels
+    const val CHANNEL_MESSAGES = "yaap_messages"
+    const val CHANNEL_CALLS = "yaap_calls"
+    const val CHANNEL_SOCIAL = "yaap_social"
+    const val CHANNEL_SYSTEM = "yaap_system"
+
+    // Audio
+    const val AUDIO_SAMPLE_RATE = 16000
+    const val AUDIO_FRAME_SIZE = 1280 // 40ms at 16kHz
+
+    // WebSocket reconnect
+    val WS_BACKOFF_DELAYS = listOf(1000L, 2000L, 4000L, 8000L, 30000L)
+    const val WS_PING_INTERVAL_MS = 30_000L
+
+    // JWT next_step values
+    const val STEP_PERSONAL_DETAILS = "personal_details"
+    const val STEP_LANGUAGE_SELECTION = "language_selection"
+    const val STEP_VOICE_TRAINING = "voice_training"
+    const val STEP_MAIN_CHAT = "main_chat"
+
+    // FCM notification types
+    const val NOTIF_MESSAGE = "message"
+    const val NOTIF_CALL = "call"
+    const val NOTIF_FRIEND_REQUEST = "friend_request"
+    const val NOTIF_VOICE_TRAINED = "voice_trained"
+    const val NOTIF_MISSED_CALL = "missed_call"
+
+    // Call timeout
+    const val CALL_TIMEOUT_MS = 30_000L
+
+    // Validation
+    const val MIN_PASSWORD_LENGTH = 8
+    const val BIO_MAX_CHARS = 160
+    const val MIN_AGE_YEARS = 13
+    const val SEARCH_DEBOUNCE_MS = 300L
+    const val TYPING_STOP_DELAY_MS = 2000L
+    const val WAVEFORM_POLL_INTERVAL_MS = 50L
+    const val MAX_RECORDING_SECONDS = 30
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\utils\Extensions.kt =====
+package com.yaap.app.utils
+
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.view.View
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.Toast
+import androidx.fragment.app.Fragment
+import com.bumptech.glide.Glide
+import com.bumptech.glide.load.resource.bitmap.CircleCrop
+import com.google.android.material.snackbar.Snackbar
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.debounce
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+// ---- View extensions ----
+
+fun View.show() { visibility = View.VISIBLE }
+fun View.hide() { visibility = View.GONE }
+fun View.invisible() { visibility = View.INVISIBLE }
+fun View.isVisible() = visibility == View.VISIBLE
+
+fun View.showSnackbar(message: String, duration: Int = Snackbar.LENGTH_SHORT) {
+    Snackbar.make(this, message, duration).show()
+}
+
+fun View.showSnackbarError(message: String) {
+    Snackbar.make(this, message, Snackbar.LENGTH_LONG).show()
+}
+
+// ---- EditText extensions ----
+
+fun EditText.textFlow(): Flow<String> = callbackFlow {
+    val watcher = object : android.text.TextWatcher {
+        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+            trySend(s.toString())
+        }
+        override fun afterTextChanged(s: android.text.Editable?) {}
+    }
+    addTextChangedListener(watcher)
+    awaitClose { removeTextChangedListener(watcher) }
+}.debounce(Constants.SEARCH_DEBOUNCE_MS)
+
+fun EditText.textString() = text.toString().trim()
+
+// ---- Activity extensions ----
+
+fun Activity.hideKeyboard() {
+    val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+    imm.hideSoftInputFromWindow(currentFocus?.windowToken, 0)
+}
+
+fun Activity.toast(message: String) {
+    Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+}
+
+// ---- Fragment extensions ----
+
+fun Fragment.toast(message: String) {
+    Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show()
+}
+
+// ---- ImageView extensions ----
+
+fun ImageView.loadAvatar(url: String?, initials: String = "?") {
+    if (url.isNullOrBlank()) {
+        // Glide placeholder with initials will be handled by a custom target
+        // For simplicity, set a default placeholder drawable
+        setImageResource(android.R.drawable.ic_menu_myplaces)
+    } else {
+        Glide.with(context)
+            .load(url)
+            .transform(CircleCrop())
+            .placeholder(android.R.drawable.ic_menu_myplaces)
+            .error(android.R.drawable.ic_menu_myplaces)
+            .into(this)
+    }
+}
+
+fun ImageView.loadRounded(url: String?, cornerRadius: Int = 12) {
+    Glide.with(context)
+        .load(url)
+        .placeholder(android.R.drawable.ic_menu_gallery)
+        .error(android.R.drawable.ic_menu_gallery)
+        .into(this)
+}
+
+// ---- Date/Time extensions ----
+
+fun String.toLocalTime(timezone: String): String {
+    return try {
+        // Assumes input is UTC ISO8601 datetime
+        val tz = TimeZone.getTimeZone(timezone)
+        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
+            timeZone = tz
+        }
+        sdf.format(Date()) // Use current time converted to their timezone
+    } catch (e: Exception) {
+        "--:--"
+    }
+}
+
+fun getCurrentTimeInTimezone(timezone: String): String {
+    return try {
+        val tz = TimeZone.getTimeZone(timezone)
+        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault()).apply {
+            timeZone = tz
+        }
+        sdf.format(Date())
+    } catch (e: Exception) {
+        "--:--"
+    }
+}
+
+fun String.toMessageTimestamp(): String {
+    return try {
+        val inputSdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault()).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val date = inputSdf.parse(this) ?: return this
+        val now = Date()
+        val diffMs = now.time - date.time
+        val diffHours = diffMs / (1000 * 60 * 60)
+        when {
+            diffHours < 1 -> {
+                val diffMins = diffMs / (1000 * 60)
+                if (diffMins < 1) "Just now" else "${diffMins}m ago"
+            }
+            diffHours < 24 -> {
+                SimpleDateFormat("HH:mm", Locale.getDefault()).format(date)
+            }
+            else -> SimpleDateFormat("MMM d", Locale.getDefault()).format(date)
+        }
+    } catch (e: Exception) {
+        this
+    }
+}
+
+// ---- Intent extras helper ----
+
+inline fun <reified T : Activity> Context.startActivity(vararg extras: Pair<String, Any?>) {
+    val intent = Intent(this, T::class.java)
+    extras.forEach { (key, value) ->
+        when (value) {
+            is String -> intent.putExtra(key, value)
+            is Int -> intent.putExtra(key, value)
+            is Boolean -> intent.putExtra(key, value)
+            is Long -> intent.putExtra(key, value)
+        }
+    }
+    startActivity(intent)
+}
+
+// ---- Validation extensions ----
+
+fun String.isValidEmail(): Boolean {
+    return android.util.Patterns.EMAIL_ADDRESS.matcher(this).matches()
+}
+
+fun String.isValidPassword(): Boolean = length >= Constants.MIN_PASSWORD_LENGTH
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\utils\Result.kt =====
+package com.yaap.app.utils
+
+/**
+ * Generic sealed class representing UI state for any async operation.
+ * ViewModels emit StateFlow<Result<T>> to the UI layer.
+ */
+sealed class Result<out T> {
+    data class Success<T>(val data: T) : Result<T>()
+    data class Error(val message: String, val code: Int? = null) : Result<Nothing>()
+    object Loading : Result<Nothing>()
+    object Idle : Result<Nothing>()
+}
+
+/**
+ * Extension to safely map success data.
+ */
+inline fun <T, R> Result<T>.map(transform: (T) -> R): Result<R> = when (this) {
+    is Result.Success -> Result.Success(transform(data))
+    is Result.Error -> this
+    is Result.Loading -> Result.Loading
+    is Result.Idle -> Result.Idle
+}
+
+/**
+ * Extension to handle success case inline.
+ */
+inline fun <T> Result<T>.onSuccess(action: (T) -> Unit): Result<T> {
+    if (this is Result.Success) action(data)
+    return this
+}
+
+/**
+ * Extension to handle error case inline.
+ */
+inline fun <T> Result<T>.onError(action: (String, Int?) -> Unit): Result<T> {
+    if (this is Result.Error) action(message, code)
+    return this
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\utils\TokenManager.kt =====
+package com.yaap.app.utils
+
+import android.content.Context
+import android.util.Base64
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import com.yaap.app.utils.Constants.PREF_ACCESS_TOKEN
+import com.yaap.app.utils.Constants.PREF_REFRESH_TOKEN
+import dagger.hilt.android.qualifiers.ApplicationContext
+import org.json.JSONObject
+import javax.inject.Inject
+import javax.inject.Singleton
+
+data class JwtClaims(
+    val userId: String?,
+    val nextStep: String?,
+    val email: String?
+)
+
+@Singleton
+class TokenManager @Inject constructor(
+    @ApplicationContext private val context: Context
+) {
+    private val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+
+    private val prefs = EncryptedSharedPreferences.create(
+        context,
+        "yaap_secure_prefs",
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    fun saveTokens(accessToken: String, refreshToken: String) {
+        prefs.edit()

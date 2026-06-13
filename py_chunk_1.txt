@@ -1,0 +1,799 @@
+from django.utils import timezone as tz
+from django.utils import timezone
+
+
+class UserManager(BaseUserManager):
+    def create_user(self, email, password=None, **extra_fields):
+        if not email:
+            raise ValueError("Email address is required.")
+        email = self.normalize_email(email)
+        extra_fields.setdefault("is_active", True)
+        user = self.model(email=email, **extra_fields)
+        if password:
+            user.set_password(password)
+        else:
+            user.set_unusable_password()
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, password, **extra_fields):
+        extra_fields.setdefault("is_staff", True)
+        extra_fields.setdefault("is_superuser", True)
+        if not extra_fields.get("is_staff"):
+            raise ValueError("Superuser must have is_staff=True.")
+        if not extra_fields.get("is_superuser"):
+            raise ValueError("Superuser must have is_superuser=True.")
+        return self.create_user(email, password, **extra_fields)
+
+
+class User(AbstractBaseUser, PermissionsMixin):
+    """
+    Central user entity.
+    Auth is handled via Supabase (tokens validated server-side),
+    but Django keeps its own user record for relational queries.
+    """
+
+    class AuthProvider(models.TextChoices):
+        EMAIL_PASSWORD = "email_password", "Email & Password"
+        EMAIL_OTP     = "email_otp",      "Email OTP"
+        GOOGLE        = "google",          "Google"
+
+    # ─── Identity ─────────────────────────────────────────────────────────────
+    id             = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email          = models.EmailField(unique=True, db_index=True)
+    full_name      = models.CharField(max_length=150)
+    display_name   = models.CharField(max_length=60, blank=True)
+    supabase_uid   = models.CharField(max_length=36, unique=True, blank=True, null=True,
+                                       help_text="Supabase Auth UID — used to verify JWT sub claim")
+
+    # ─── Profile ──────────────────────────────────────────────────────────────
+    avatar_url     = models.TextField(blank=True, default="")
+    bio            = models.CharField(max_length=160, blank=True, default="")
+    date_of_birth  = models.DateField(null=True, blank=True)
+    country_code   = models.CharField(max_length=2, blank=True, default="")
+    timezone = models.CharField(max_length=64, blank=True, default="UTC")
+
+
+    # ─── Language & Voice ─────────────────────────────────────────────────────
+    language_preference = models.CharField(
+        max_length=5,
+        choices=[(code, name) for code, name in settings.YAAP_LANGUAGE_NAMES.items()],
+        default="en",
+    )
+    voice_trained       = models.BooleanField(default=False)
+    voice_embedding     = models.JSONField(null=True, blank=True,
+                                           help_text="XTTS speaker embedding vector (256-dim list)")
+
+    # ─── Auth Provider ────────────────────────────────────────────────────────
+    auth_provider  = models.CharField(
+        max_length=20,
+        choices=AuthProvider.choices,
+        default=AuthProvider.EMAIL_PASSWORD,
+    )
+
+    # ─── Onboarding State ─────────────────────────────────────────────────────
+    profile_complete     = models.BooleanField(default=False)
+    language_selected    = models.BooleanField(default=False)
+
+    # ─── Presence ─────────────────────────────────────────────────────────────
+    is_online    = models.BooleanField(default=False, db_index=True)
+    last_seen    = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # ─── Privacy Settings ─────────────────────────────────────────────────────
+    class LastSeenVisibility(models.TextChoices):
+        EVERYONE = "everyone", "Everyone"
+        FRIENDS  = "friends",  "Friends Only"
+        NOBODY   = "nobody",   "Nobody"
+
+    last_seen_visibility   = models.CharField(max_length=10, choices=LastSeenVisibility.choices, default=LastSeenVisibility.EVERYONE)
+    show_read_receipts     = models.BooleanField(default=True)
+    show_online_status     = models.BooleanField(default=True)
+
+    # ─── Django Admin Fields ──────────────────────────────────────────────────
+    is_active   = models.BooleanField(default=True)
+    is_staff    = models.BooleanField(default=False)
+    is_verified = models.BooleanField(default=False,
+                                       help_text="Email verified (OTP or Supabase callback)")
+    created_at  = models.DateTimeField(default=tz.now)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+    objects = UserManager()
+
+    USERNAME_FIELD  = "email"
+    REQUIRED_FIELDS = ["full_name"]
+
+    class Meta:
+        db_table = "users"
+        indexes = [
+            models.Index(fields=["email"]),
+            models.Index(fields=["display_name"]),
+            models.Index(fields=["supabase_uid"]),
+            models.Index(fields=["is_online", "last_seen"]),
+        ]
+
+    def __str__(self):
+        return f"{self.display_name or self.full_name} <{self.email}>"
+
+    @property
+    def name(self) -> str:
+        return self.display_name or self.full_name
+
+    def mark_online(self):
+        self.is_online = True
+        self.save(update_fields=["is_online"])
+
+    def mark_offline(self):
+        self.is_online = False
+        self.last_seen = timezone.now()
+        self.save(update_fields=["is_online", "last_seen"])
+
+
+class EmailOTP(models.Model):
+    """
+    Stores time-limited one-time passwords for passwordless email login.
+    OTPs are 6-digit codes, valid for OTP_EXPIRY_MINUTES.
+    """
+    id         = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email      = models.EmailField(db_index=True)
+    code       = models.CharField(max_length=6)
+    is_used    = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    attempts   = models.PositiveSmallIntegerField(default=0,
+                                                   help_text="Number of failed verification attempts")
+
+    class Meta:
+        db_table = "email_otps"
+        indexes = [models.Index(fields=["email", "is_used", "expires_at"])]
+
+    def is_valid(self) -> bool:
+        return not self.is_used and timezone.now() < self.expires_at and self.attempts < 5
+
+    def __str__(self):
+        return f"OTP for {self.email} ({'used' if self.is_used else 'active'})"
+# ===== d:/yaap1/YAAP\backend\apps\accounts\serializers.py =====
+"""
+YAAP Accounts Serializers
+Covers all three auth methods: Email+Password, Email OTP, Google OAuth.
+"""
+
+import logging
+import re
+from django.conf import settings
+from django.contrib.auth import authenticate
+from django.utils import timezone
+from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from .models import User, EmailOTP
+
+logger = logging.getLogger(__name__)
+
+# ─── Password Strength ────────────────────────────────────────────────────────
+
+def _password_strength(password: str) -> dict:
+    """
+    Returns strength info used by the frontend meter.
+    Levels: weak | fair | strong | very_strong
+    """
+    score = 0
+    has_upper   = bool(re.search(r"[A-Z]", password))
+    has_lower   = bool(re.search(r"[a-z]", password))
+    has_digit   = bool(re.search(r"\d", password))
+    has_symbol  = bool(re.search(r"[^A-Za-z0-9]", password))
+    length      = len(password)
+
+    if length >= 8:  score += 1
+    if length >= 12: score += 1
+    if has_upper:    score += 1
+    if has_lower:    score += 1
+    if has_digit:    score += 1
+    if has_symbol:   score += 1
+
+    level = "weak"
+    if score >= 6:   level = "very_strong"
+    elif score >= 4: level = "strong"
+    elif score >= 2: level = "fair"
+
+    return {
+        "score": score,
+        "level": level,
+        "has_upper": has_upper,
+        "has_lower": has_lower,
+        "has_digit": has_digit,
+        "has_symbol": has_symbol,
+        "length": length,
+    }
+
+
+# ─── JWT Custom Claims ────────────────────────────────────────────────────────
+
+class YAAPTokenObtainPairSerializer(TokenObtainPairSerializer):
+    """Adds extra claims to JWT payload consumed by Kotlin client."""
+
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token["email"]             = user.email
+        token["display_name"]      = user.name
+        token["language"]          = user.language_preference
+        token["voice_trained"]     = user.voice_trained
+        token["profile_complete"]  = user.profile_complete
+        token["language_selected"] = user.language_selected
+        token["avatar_url"]        = user.avatar_url
+        return token
+
+
+def _make_tokens(user: User) -> dict:
+    """Utility: create access + refresh token pair for a user."""
+    refresh = RefreshToken.for_user(user)
+    # Add custom claims
+    refresh["email"]             = user.email
+    refresh["display_name"]      = user.name
+    refresh["language"]          = user.language_preference
+    refresh["voice_trained"]     = user.voice_trained
+    refresh["profile_complete"]  = user.profile_complete
+    refresh["language_selected"] = user.language_selected
+    refresh["avatar_url"]        = user.avatar_url
+    return {
+        "access":  str(refresh.access_token),
+        "refresh": str(refresh),
+    }
+
+
+# ─── Email + Password Signup ──────────────────────────────────────────────────
+
+class SignupSerializer(serializers.Serializer):
+    full_name        = serializers.CharField(min_length=2, max_length=150)
+    email            = serializers.EmailField()
+    password         = serializers.CharField(write_only=True, min_length=8)
+    password_confirm = serializers.CharField(write_only=True)
+
+    def validate_email(self, value):
+        normalized = value.lower().strip()
+        if User.objects.filter(email=normalized).exists():
+            raise serializers.ValidationError(
+                "An account with this email address already exists."
+            )
+        return normalized
+
+    def validate_full_name(self, value):
+        value = value.strip()
+        if re.match(r"^\d+$", value):
+            raise serializers.ValidationError("Name cannot be numeric only.")
+        return value
+
+    def validate(self, attrs):
+        if attrs["password"] != attrs["password_confirm"]:
+            raise serializers.ValidationError({"password_confirm": "Passwords do not match."})
+
+        strength = _password_strength(attrs["password"])
+        if strength["level"] == "weak":
+            raise serializers.ValidationError(
+                {"password": "Password is too weak. Use at least 8 characters with mixed case and numbers."}
+            )
+        attrs["password_strength"] = strength
+        return attrs
+
+    def create(self, validated_data):
+        validated_data.pop("password_confirm")
+        validated_data.pop("password_strength", None)
+        password = validated_data.pop("password")
+        email    = validated_data.pop("email")
+
+        user = User.objects.create_user(
+            email=email,
+            password=password,
+            auth_provider=User.AuthProvider.EMAIL_PASSWORD,
+            **validated_data,
+        )
+        return user
+
+
+class SignupResponseSerializer(serializers.Serializer):
+    """Shape of the signup response returned to the Kotlin client."""
+    user   = serializers.SerializerMethodField()
+    tokens = serializers.SerializerMethodField()
+
+    def get_user(self, obj):
+        return UserMiniSerializer(obj).data
+
+    def get_tokens(self, obj):
+        return _make_tokens(obj)
+
+
+# ─── Email + Password Login ───────────────────────────────────────────────────
+
+class LoginSerializer(serializers.Serializer):
+    email    = serializers.EmailField()
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        email    = attrs["email"].lower().strip()
+        password = attrs["password"]
+
+        user = authenticate(request=self.context.get("request"), username=email, password=password)
+        if not user:
+            raise serializers.ValidationError(
+                {"non_field_errors": "Invalid credentials. Please check your email and password."}
+            )
+        if not user.is_active:
+            raise serializers.ValidationError(
+                {"non_field_errors": "Your account has been deactivated. Contact support."}
+            )
+        attrs["user"] = user
+        return attrs
+
+class LogoutSerializer(serializers.Serializer):
+    refresh = serializers.CharField(required=True)
+
+    def validate_refresh(self, value):
+        if not value or not value.strip():
+            raise serializers.ValidationError("Refresh token is required.")
+        return value.strip()
+
+# ─── Email OTP ────────────────────────────────────────────────────────────────
+
+class OTPRequestSerializer(serializers.Serializer):
+    """Request a 6-digit OTP to the given email address."""
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return value.lower().strip()
+
+
+class OTPVerifySerializer(serializers.Serializer):
+    """Verify the OTP and return tokens."""
+    email = serializers.EmailField()
+    code  = serializers.CharField(min_length=6, max_length=6)
+
+    def validate_email(self, value):
+        return value.lower().strip()
+
+    def validate_code(self, value):
+        if not value.isdigit():
+            raise serializers.ValidationError("OTP must be a 6-digit number.")
+        return value
+
+    def validate(self, attrs):
+        email = attrs["email"]
+        code  = attrs["code"]
+
+        try:
+            otp = (
+                EmailOTP.objects
+                .filter(email=email, is_used=False)
+                .order_by("-created_at")
+                .first()
+            )
+            if not otp or not otp.is_valid():
+                raise serializers.ValidationError(
+                    {"code": "OTP has expired or is invalid. Please request a new one."}
+                )
+            if otp.code != code:
+                otp.attempts += 1
+                otp.save(update_fields=["attempts"])
+                remaining = 5 - otp.attempts
+                raise serializers.ValidationError(
+                    {"code": f"Incorrect OTP. {remaining} attempt(s) remaining."}
+                )
+        except EmailOTP.DoesNotExist:
+            raise serializers.ValidationError({"code": "No OTP found for this email."})
+
+        attrs["otp"]   = otp
+        attrs["email"] = email
+        return attrs
+
+
+# ─── Google OAuth ─────────────────────────────────────────────────────────────
+
+class GoogleAuthSerializer(serializers.Serializer):
+    """
+    Receives the ID token from the Android Google Sign-In SDK.
+    Backend verifies it with Google's tokeninfo endpoint.
+    """
+    id_token = serializers.CharField(write_only=True)
+
+
+# ─── Token Refresh ────────────────────────────────────────────────────────────
+
+class TokenRefreshResponseSerializer(serializers.Serializer):
+    access  = serializers.CharField()
+    refresh = serializers.CharField()
+
+
+# ─── Password Reset ───────────────────────────────────────────────────────────
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return value.lower().strip()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    token        = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, min_length=8)
+
+    def validate_new_password(self, value):
+        strength = _password_strength(value)
+        if strength["level"] == "weak":
+            raise serializers.ValidationError(
+                "Password is too weak. Use at least 8 characters with uppercase, lowercase, and digits."
+            )
+        return value
+
+
+# ─── Password Strength Check (standalone endpoint) ───────────────────────────
+
+class PasswordStrengthSerializer(serializers.Serializer):
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        attrs["strength"] = _password_strength(attrs["password"])
+        return attrs
+
+
+# ─── User Profile ─────────────────────────────────────────────────────────────
+
+class UserMiniSerializer(serializers.ModelSerializer):
+    """Compact user representation used inside auth responses and friend lists."""
+
+    class Meta:
+        model = User
+        fields = [
+            "id", "email", "full_name", "display_name", "avatar_url",
+            "country_code", "timezone", "language_preference",
+            "voice_trained", "profile_complete", "language_selected",
+            "is_online", "last_seen", "auth_provider", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """Full profile — returned for /api/v1/users/me/"""
+
+    class Meta:
+        model = User
+        fields = [
+            "id", "email", "full_name", "display_name", "avatar_url",
+            "bio", "date_of_birth", "country_code", "timezone",
+            "language_preference", "voice_trained", "profile_complete",
+            "language_selected", "is_online", "last_seen",
+            "last_seen_visibility", "show_read_receipts", "show_online_status",
+            "auth_provider", "is_verified", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "email", "supabase_uid", "auth_provider",
+            "voice_trained", "is_verified", "created_at", "updated_at",
+        ]
+
+    def validate_display_name(self, value):
+        value = value.strip()
+        if len(value) < 2 or len(value) > 60:
+            raise serializers.ValidationError("Display name must be 2–60 characters.")
+        return value
+
+    def validate_bio(self, value):
+        if len(value) > 160:
+            raise serializers.ValidationError("Bio cannot exceed 160 characters.")
+        return value.strip()
+
+    def validate_language_preference(self, value):
+        if value not in settings.YAAP_SUPPORTED_LANGUAGES:
+            raise serializers.ValidationError(
+                f"Unsupported language. Choose from: {', '.join(settings.YAAP_SUPPORTED_LANGUAGES)}"
+            )
+        return value
+
+    def validate_country_code(self, value):
+        if value and len(value) != 2:
+            raise serializers.ValidationError("Country code must be a 2-letter ISO code (e.g. 'PK').")
+        return value.upper()
+
+
+class UserPublicProfileSerializer(serializers.ModelSerializer):
+    """
+    Public profile — what OTHER users see.
+    Respects privacy settings: last_seen and online status may be hidden.
+    """
+    last_seen   = serializers.SerializerMethodField()
+    is_online   = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id", "display_name", "avatar_url", "bio",
+            "country_code", "timezone", "language_preference",
+            "is_online", "last_seen", "created_at",
+        ]
+
+    def get_last_seen(self, obj):
+        requesting_user = self.context.get("request").user
+        vis = obj.last_seen_visibility
+        if vis == User.LastSeenVisibility.NOBODY:
+            return None
+        if vis == User.LastSeenVisibility.FRIENDS:
+            from apps.friendships.models import Friendship
+            if not Friendship.objects.are_friends(requesting_user, obj):
+                return None
+        return obj.last_seen
+
+    def get_is_online(self, obj):
+        if not obj.show_online_status:
+            return None
+        return obj.is_online
+
+
+class UpdateLanguageSerializer(serializers.Serializer):
+    language_preference = serializers.ChoiceField(
+        choices=settings.YAAP_SUPPORTED_LANGUAGES
+    )
+
+
+class UserSearchSerializer(serializers.ModelSerializer):
+    """Result card for /api/v1/users/search/"""
+    friendship_status = serializers.SerializerMethodField()
+    mutual_friends    = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            "id", "display_name", "avatar_url", "country_code",
+            "language_preference", "is_online", "friendship_status", "mutual_friends",
+        ]
+
+    def get_friendship_status(self, obj):
+        from apps.friendships.models import Friendship, FriendRequest
+        requesting_user = self.context["request"].user
+        if Friendship.objects.are_friends(requesting_user, obj):
+            return "friends"
+        req = FriendRequest.objects.filter(
+            from_user=requesting_user, to_user=obj, status=FriendRequest.Status.PENDING
+        ).first()
+        if req:
+            return "requested"
+        return "none"
+
+    def get_mutual_friends(self, obj):
+        from apps.friendships.models import Friendship
+        requesting_user = self.context["request"].user
+        return Friendship.objects.mutual_friends_count(requesting_user, obj)
+# ===== d:/yaap1/YAAP\backend\apps\accounts\signals.py =====
+"""
+Signal handlers for the accounts app.
+- Update display_name default after creation
+- Log user creation events
+"""
+
+import logging
+from django.db.models.signals import post_save, pre_save
+from django.dispatch import receiver
+from django.contrib.auth import get_user_model
+
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
+
+@receiver(post_save, sender=User)
+def set_default_display_name(sender, instance, created, **kwargs):
+    """If display_name is blank on creation, set it to the first part of full_name."""
+    if created and not instance.display_name:
+        instance.display_name = instance.full_name.split()[0] if instance.full_name else instance.email.split("@")[0]
+        User.objects.filter(pk=instance.pk).update(display_name=instance.display_name)
+        logger.info("Set default display_name for new user %s", instance.id)
+
+
+@receiver(post_save, sender=User)
+def log_user_creation(sender, instance, created, **kwargs):
+    if created:
+        logger.info(
+            "New user created: id=%s email=%s provider=%s",
+            instance.id,
+            instance.email,
+            instance.auth_provider,
+        )
+# ===== d:/yaap1/YAAP\backend\apps\accounts\__init__.py =====
+default_app_config = "apps.accounts.apps.AccountsConfig"
+# ===== d:/yaap1/YAAP\backend\apps\accounts\tests\test_auth.py =====
+"""
+Auth endpoint tests — Phase 1.
+Covers: signup, login, OTP request/verify, logout, password strength, token refresh.
+"""
+
+import pytest
+from django.urls import reverse
+from django.utils import timezone
+from datetime import timedelta
+from django.contrib.auth import get_user_model
+
+from apps.accounts.models import EmailOTP
+
+User = get_user_model()
+
+
+# ─── Signup ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestSignup:
+
+    URL = "/api/v1/auth/signup/"
+
+    def test_signup_success(self, api_client, mocker):
+        mocker.patch("apps.accounts.views.auth_views.get_supabase_admin_client")
+        resp = api_client.post(self.URL, {
+            "full_name":        "Alice Yaap",
+            "email":            "alice@yaap.app",
+            "password":         "SecurePass1!",
+            "password_confirm": "SecurePass1!",
+        })
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["success"] is True
+        assert "access" in data["data"]["tokens"]
+        assert "refresh" in data["data"]["tokens"]
+        assert data["data"]["next_step"] == "personal_details"
+        assert User.objects.filter(email="alice@yaap.app").exists()
+
+    def test_signup_duplicate_email(self, api_client, user, mocker):
+        mocker.patch("apps.accounts.views.auth_views.get_supabase_admin_client")
+        resp = api_client.post(self.URL, {
+            "full_name":        "Dupe User",
+            "email":            user.email,
+            "password":         "SecurePass1!",
+            "password_confirm": "SecurePass1!",
+        })
+        assert resp.status_code == 400
+        assert resp.json()["success"] is False
+
+    def test_signup_password_mismatch(self, api_client):
+        resp = api_client.post(self.URL, {
+            "full_name":        "Bob",
+            "email":            "bob@yaap.app",
+            "password":         "SecurePass1!",
+            "password_confirm": "DifferentPass1!",
+        })
+        assert resp.status_code == 400
+
+    def test_signup_weak_password_rejected(self, api_client):
+        resp = api_client.post(self.URL, {
+            "full_name":        "Weak Bob",
+            "email":            "weak@yaap.app",
+            "password":         "abc",
+            "password_confirm": "abc",
+        })
+        assert resp.status_code == 400
+
+    def test_signup_numeric_name_rejected(self, api_client):
+        resp = api_client.post(self.URL, {
+            "full_name":        "12345",
+            "email":            "numeric@yaap.app",
+            "password":         "SecurePass1!",
+            "password_confirm": "SecurePass1!",
+        })
+        assert resp.status_code == 400
+
+
+# ─── Login ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestLogin:
+
+    URL = "/api/v1/auth/login/"
+
+    def test_login_success(self, api_client, user):
+        resp = api_client.post(self.URL, {"email": user.email, "password": "TestPass123!"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+        assert "access" in data["data"]["tokens"]
+
+    def test_login_wrong_password(self, api_client, user):
+        resp = api_client.post(self.URL, {"email": user.email, "password": "WrongPass!"})
+        assert resp.status_code == 400
+        assert resp.json()["success"] is False
+
+    def test_login_nonexistent_email(self, api_client):
+        resp = api_client.post(self.URL, {"email": "ghost@yaap.app", "password": "Pass123!"})
+        assert resp.status_code == 400
+
+    def test_login_returns_next_step(self, api_client, user):
+        resp = api_client.post(self.URL, {"email": user.email, "password": "TestPass123!"})
+        assert "next_step" in resp.json()["data"]
+
+    def test_login_inactive_user_rejected(self, api_client, user):
+        user.is_active = False
+        user.save()
+        resp = api_client.post(self.URL, {"email": user.email, "password": "TestPass123!"})
+        assert resp.status_code == 400
+
+
+# ─── OTP ──────────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestOTP:
+
+    REQUEST_URL = "/api/v1/auth/otp/request/"
+    VERIFY_URL  = "/api/v1/auth/otp/verify/"
+
+    def test_otp_request_success(self, api_client, mocker):
+        mocker.patch("apps.accounts.views.auth_views.send_otp_email.delay")
+        resp = api_client.post(self.REQUEST_URL, {"email": "otp_user@yaap.app"})
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert EmailOTP.objects.filter(email="otp_user@yaap.app").exists()
+
+    def test_otp_verify_success(self, api_client, mocker):
+        mocker.patch("apps.accounts.views.auth_views.get_supabase_admin_client")
+        email = "verify@yaap.app"
+        otp   = EmailOTP.objects.create(
+            email      = email,
+            code       = "123456",
+            expires_at = timezone.now() + timedelta(minutes=10),
+        )
+        resp = api_client.post(self.VERIFY_URL, {"email": email, "code": "123456"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["success"] is True
+        assert "access" in data["data"]["tokens"]
+        assert data["data"]["is_new"] is True
+        otp.refresh_from_db()
+        assert otp.is_used is True
+
+    def test_otp_verify_wrong_code(self, api_client):
+        email = "wrong@yaap.app"
+        EmailOTP.objects.create(
+            email      = email,
+            code       = "111111",
+            expires_at = timezone.now() + timedelta(minutes=10),
+        )
+        resp = api_client.post(self.VERIFY_URL, {"email": email, "code": "999999"})
+        assert resp.status_code == 400
+
+    def test_otp_verify_expired(self, api_client):
+        email = "expired@yaap.app"
+        EmailOTP.objects.create(
+            email      = email,
+            code       = "222222",
+            expires_at = timezone.now() - timedelta(minutes=1),  # already expired
+        )
+        resp = api_client.post(self.VERIFY_URL, {"email": email, "code": "222222"})
+        assert resp.status_code == 400
+
+    def test_otp_invalidated_on_new_request(self, api_client, mocker):
+        mocker.patch("apps.accounts.views.auth_views.send_otp_email.delay")
+        email = "invalidate@yaap.app"
+        old   = EmailOTP.objects.create(
+            email      = email,
+            code       = "000000",
+            expires_at = timezone.now() + timedelta(minutes=10),
+        )
+        api_client.post(self.REQUEST_URL, {"email": email})
+        old.refresh_from_db()
+        assert old.is_used is True  # old OTP invalidated
+
+
+# ─── Password Strength ────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestPasswordStrength:
+
+    URL = "/api/v1/auth/password/strength/"
+
+    @pytest.mark.parametrize("password,expected_level", [
+        ("abc",            "weak"),
+        ("abcdefgh",       "fair"),
+        ("Abcdefgh1",      "strong"),
+        ("Abcdefgh1!xyz",  "very_strong"),
+    ])
+    def test_strength_levels(self, api_client, password, expected_level):
+        resp = api_client.post(self.URL, {"password": password})
+        assert resp.status_code == 200
+        assert resp.json()["data"]["strength"]["level"] == expected_level
+
+
+# ─── Logout ───────────────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestLogout:

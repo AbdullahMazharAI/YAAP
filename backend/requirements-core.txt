@@ -15,7 +15,7 @@ djangorestframework-simplejwt==5.3.1
 PyJWT==2.8.0
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
-httpx==0.27.0          # for Supabase OTP email verification calls
+httpx==0.27.0
 
 # ─── Supabase ─────────────────────────────────────────────────────────────────
 supabase==2.4.3
@@ -25,7 +25,6 @@ gotrue==2.4.3
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 psycopg2-binary>=2.9.10
-
 
 # ─── Celery / Task Queue ──────────────────────────────────────────────────────
 celery==5.3.6
@@ -39,12 +38,12 @@ django-ratelimit==4.1.0
 cryptography==42.0.5
 
 # ─── Storage ──────────────────────────────────────────────────────────────────
-boto3==1.34.84           # AWS S3 (Cloud storage fallback / presigned URLs)
-Pillow>=11.0.0           # image processing for avatar resizing
+boto3==1.34.84
+Pillow>=11.0.0
 
 # ─── Translation ──────────────────────────────────────────────────────────────
 deepl==1.18.0
-# sentencepiece==0.2.0     # Helsinki-NLP tokenizer (disabled on Windows host to avoid build failures; XTTS/Whisper/MarianMT run in separate microservices)
+# sentencepiece==0.2.0 (disabled on Windows host to avoid build failures; XTTS/Whisper/MarianMT run in separate microservices)
 
 # ─── Push Notifications ───────────────────────────────────────────────────────
 firebase-admin==6.5.0
@@ -66,13 +65,11 @@ coverage==7.4.4
 
 # ─── Dev Utilities ────────────────────────────────────────────────────────────
 python-decouple==3.8
-whitenoise==6.6.0        # static file serving
-gunicorn==22.0.0         # WSGI server
-uvicorn[standard]==0.29.0  # ASGI server for Channels
+whitenoise==6.6.0
+gunicorn==22.0.0
+uvicorn[standard]==0.29.0
 
-# ─── Phase 4: Audio Processing ────────────────────────────────────────────────
-pydub==0.25.1            # audio format conversion (requires ffmpeg system package)
-torch==2.2.2             # Silero VAD + XTTS dependencies
-torchaudio==2.2.2        # audio I/O for VAD
-pyaudio==0.2.14          # microphone input (used by mobile — not needed server-side, optional)
-soundfile==0.12.1        # WAV/FLAC I/O alternative to wave module
+# ─── Audio (lightweight only — no torch/GPU) ─────────────────────────────────
+pydub==0.25.1
+soundfile==0.12.1
+# NOTE: torch, torchaudio, pyaudio excluded — only needed by XTTS/Whisper microservices

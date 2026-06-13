@@ -1,0 +1,800 @@
+        logger.exception("XTTS /embed unexpected error: %s", e)
+        return None
+
+
+# ─── Speech Synthesis (Phase 7 — stub here for wiring) ───────────────────────
+
+def synthesize_speech(
+    text: str,
+    embedding: list[float],
+    language: str,
+    speed: float = 1.0,
+) -> bytes | None:
+    """
+    Synthesize speech from text using a pre-computed speaker embedding.
+    Returns raw WAV bytes, or None on failure.
+    Used in Phase 7 (call translation pipeline).
+    """
+    try:
+        response = httpx.post(
+            f"{XTTS_URL}/synthesize",
+            json    = {
+                "text":      text,
+                "embedding": embedding,
+                "language":  language,
+                "speed":     speed,
+            },
+            timeout = SYNTHESIS_TIMEOUT,
+        )
+        response.raise_for_status()
+        logger.info("XTTS synthesis: %d chars → %d bytes WAV", len(text), len(response.content))
+        return response.content
+
+    except httpx.TimeoutException:
+        logger.error("XTTS /synthesize timed out")
+        return None
+    except httpx.HTTPStatusError as e:
+        logger.error("XTTS /synthesize HTTP error: %s", e.response.status_code)
+        return None
+    except Exception as e:
+        logger.exception("XTTS /synthesize unexpected error: %s", e)
+        return None
+
+
+# ─── Health Check ─────────────────────────────────────────────────────────────
+
+def is_xtts_service_healthy() -> bool:
+    """Ping the XTTS microservice health endpoint."""
+    try:
+        r = httpx.get(f"{XTTS_URL}/health", timeout=5.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+# ===== d:/yaap1/YAAP\backend\services\__init__.py =====
+# Services package — external integrations (Supabase, email, XTTS, Whisper, DeepL, FCM)
+# ===== d:/yaap1/YAAP\backend\tasks\call_tasks.py =====
+"""
+Call Celery Tasks
+
+mark_missed_if_unanswered — scheduled 30 s after initiation
+  If the callee hasn't answered by then, mark the call MISSED
+  and push a missed call notification.
+
+cleanup_stale_calls — periodic beat task (every 5 minutes)
+  Finds calls stuck in INITIATED/ANSWERED state for > 2 hours
+  and forcibly ends them to prevent stale DB records.
+"""
+
+import logging
+from celery import shared_task
+from django.utils import timezone
+from datetime import timedelta
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(name="calls.mark_missed_if_unanswered", queue="default")
+def mark_missed_if_unanswered(call_room_id: str):
+    """
+    Called 30 seconds after call initiation.
+    If the call is still in INITIATED state (not answered or declined),
+    mark it as MISSED and notify the caller via FCM.
+    """
+    from apps.calls.models import CallRoom
+    try:
+        room = CallRoom.objects.select_related("caller", "callee").get(id=call_room_id)
+    except CallRoom.DoesNotExist:
+        logger.warning("mark_missed: room %s not found", call_room_id)
+        return
+
+    if room.status != CallRoom.Status.INITIATED:
+        logger.debug("mark_missed: room %s already %s — skip", call_room_id, room.status)
+        return
+
+    room.mark_missed()
+    logger.info("Call marked MISSED: room=%s caller=%s callee=%s", room.room_id, room.caller_id, room.callee_id)
+
+    # Push missed call notification to caller
+    try:
+        from apps.friendships.models import UserDevice
+        from services.fcm_service import send_push
+        tokens = list(UserDevice.objects.filter(user=room.caller).values_list("fcm_token", flat=True))
+        for token in tokens:
+            send_push(
+                device_token      = token,
+                title             = "Missed Call",
+                body              = f"{room.callee.name} didn't answer.",
+                data              = {"type": "missed_call", "room_id": str(room.room_id), "callee_id": str(room.callee_id)},
+                notification_type = "call",
+            )
+    except Exception as e:
+        logger.warning("FCM missed call push failed: %s", e)
+
+    # Also notify callee they missed a call
+    try:
+        from apps.friendships.models import UserDevice
+        from services.fcm_service import send_push
+        tokens = list(UserDevice.objects.filter(user=room.callee).values_list("fcm_token", flat=True))
+        for token in tokens:
+            send_push(
+                device_token      = token,
+                title             = "Missed Call",
+                body              = f"You missed a call from {room.caller.name}.",
+                data              = {"type": "missed_call", "room_id": str(room.room_id), "caller_id": str(room.caller_id)},
+                notification_type = "call",
+            )
+    except Exception as e:
+        logger.warning("FCM missed call callee push failed: %s", e)
+
+
+@shared_task(name="calls.cleanup_stale_calls", queue="default")
+def cleanup_stale_calls():
+    """
+    Periodic task — ends calls stuck in INITIATED/ANSWERED for > 2 hours.
+    Registered in Django Celery Beat via admin or programmatically.
+    """
+    from apps.calls.models import CallRoom
+    cutoff  = timezone.now() - timedelta(hours=2)
+    stale   = CallRoom.objects.filter(
+        status__in = [CallRoom.Status.INITIATED, CallRoom.Status.ANSWERED],
+        started_at__lt = cutoff,
+    )
+    count = stale.count()
+    for room in stale:
+        room.end()
+
+    if count:
+        logger.warning("cleanup_stale_calls: ended %d stale call(s)", count)
+    return {"cleaned": count}
+# ===== d:/yaap1/YAAP\backend\tasks\voice_tasks.py =====
+"""
+Voice Training Celery Task
+Full pipeline:
+  1. Load job + user from DB
+  2. Download all 5 WAV samples from Supabase Storage
+  3. Process each: VAD trim → normalize → validate
+  4. Send to XTTS microservice → receive 256-dim embedding
+  5. Save embedding to user.voice_embedding
+  6. Mark user.voice_trained = True
+  7. Push completion event to user via WebSocket (Django Channels)
+  8. Send FCM push notification
+  9. Send welcome email if first time training
+
+Error handling:
+  - Each step wrapped individually so partial failures are logged
+  - Job marked FAILED with reason stored in error_message
+  - User notified of failure via FCM so the app can show a retry prompt
+"""
+
+import logging
+import os
+import tempfile
+from pathlib import Path
+
+from celery import shared_task
+from django.conf import settings
+from django.contrib.auth import get_user_model
+
+logger = logging.getLogger(__name__)
+User   = get_user_model()
+
+
+@shared_task(
+    bind              = True,
+    name              = "voice.train_voice_model",
+    queue             = "voice_training",
+    max_retries       = 2,
+    default_retry_delay = 60,
+    soft_time_limit   = 240,
+    time_limit        = 300,
+)
+def train_voice_model(self, job_id: str):
+    """
+    Main voice training task.
+    Called after user uploads all 5 voice samples and hits POST /api/v1/voice/train/.
+    """
+    from apps.voice.models import VoiceTrainingJob, VoiceSample
+
+    # ── Load job ──────────────────────────────────────────────────────────────
+    try:
+        job  = VoiceTrainingJob.objects.select_related("user").get(id=job_id)
+        user = job.user
+    except VoiceTrainingJob.DoesNotExist:
+        logger.error("train_voice_model: job %s not found", job_id)
+        return
+
+    logger.info("Voice training started: job=%s user=%s", job_id, user.id)
+    job.mark_processing(self.request.id)
+
+    with tempfile.TemporaryDirectory(prefix="yaap_voice_") as tmpdir:
+        try:
+            # ── Download samples from Supabase Storage ────────────────────────
+            samples = list(
+                VoiceSample.objects.filter(user=user)
+                .order_by("sample_index")
+                .select_related("sentence")
+            )
+
+            if len(samples) < settings.YAAP_MAX_VOICE_SAMPLES:
+                raise ValueError(
+                    f"Expected {settings.YAAP_MAX_VOICE_SAMPLES} samples, "
+                    f"found {len(samples)}. User must re-upload."
+                )
+
+            local_paths = _download_samples(samples, tmpdir)
+
+            # ── Process each WAV ──────────────────────────────────────────────
+            processed_paths = _process_samples(local_paths, tmpdir)
+
+            if not processed_paths:
+                raise ValueError("All audio samples failed quality checks.")
+
+            # ── Compute XTTS speaker embedding ────────────────────────────────
+            embedding = _compute_embedding(processed_paths)
+
+            if not embedding:
+                raise ValueError("XTTS service failed to compute speaker embedding.")
+
+            # ── Save embedding to user profile ────────────────────────────────
+            _save_embedding(user, embedding)
+
+            # ── Mark job complete ─────────────────────────────────────────────
+            job.samples_count = len(processed_paths)
+            job.save(update_fields=["samples_count"])
+            job.mark_completed()
+
+            logger.info(
+                "Voice training completed: job=%s user=%s embedding_dim=%d",
+                job_id, user.id, len(embedding),
+            )
+
+            # ── Notify user ───────────────────────────────────────────────────
+            _notify_success(user)
+
+        except Exception as exc:
+            reason = str(exc)
+            logger.error("Voice training failed: job=%s error=%s", job_id, reason, exc_info=True)
+            job.mark_failed(reason)
+            _notify_failure(user, reason)
+
+            # Retry on transient errors (network, XTTS service down)
+            if _is_retryable(exc):
+                raise self.retry(exc=exc)
+
+
+# ─── Pipeline Steps ───────────────────────────────────────────────────────────
+
+def _download_samples(samples, tmpdir: str) -> list[str]:
+    """
+    Download each sample WAV from Supabase Storage to a temp directory.
+    Returns list of local file paths.
+    """
+    from services.supabase_client import get_supabase_storage_client
+
+    storage    = get_supabase_storage_client()
+    bucket     = settings.SUPABASE_STORAGE_BUCKET_VOICE_SAMPLES
+    local_paths = []
+
+    for sample in samples:
+        dest = os.path.join(tmpdir, f"sample_{sample.sample_index}.wav")
+        try:
+            response = storage.from_(bucket).download(sample.storage_path)
+            with open(dest, "wb") as f:
+                f.write(response)
+            local_paths.append(dest)
+            logger.debug("Downloaded sample %d → %s (%d bytes)", sample.sample_index, dest, len(response))
+        except Exception as e:
+            logger.error("Failed to download sample %s: %s", sample.storage_path, e)
+            # Skip this sample but continue — 3 out of 5 is enough for XTTS
+
+    return local_paths
+
+
+def _process_samples(local_paths: list[str], tmpdir: str) -> list[str]:
+    """
+    Run the audio processing pipeline on each downloaded WAV.
+    Returns paths to processed files that passed quality checks.
+    """
+    from services.audio_processing import validate_and_process_wav
+
+    processed = []
+
+    for path in local_paths:
+        try:
+            raw_bytes = Path(path).read_bytes()
+            result    = validate_and_process_wav(raw_bytes, filename=os.path.basename(path))
+
+            if not result["ok"]:
+                logger.warning("Sample %s failed validation: %s", path, result["error"])
+                continue
+
+            # Write processed WAV to tmpdir
+            processed_path = path.replace(".wav", "_processed.wav")
+            Path(processed_path).write_bytes(result["processed_bytes"])
+            processed.append(processed_path)
+
+            logger.info(
+                "Sample processed: %s duration=%.1fs noise_floor=%.1fdBFS",
+                os.path.basename(path),
+                result["duration"],
+                result["noise_floor_db"],
+            )
+
+        except Exception as e:
+            logger.error("Audio processing error for %s: %s", path, e)
+
+    logger.info("Processed %d/%d voice samples", len(processed), len(local_paths))
+    return processed
+
+
+def _compute_embedding(processed_paths: list[str]) -> list[float] | None:
+    """Call XTTS microservice to compute speaker embedding."""
+    from services.xtts_client import compute_speaker_embedding
+    return compute_speaker_embedding(processed_paths)
+
+
+def _save_embedding(user, embedding: list[float]):
+    """Persist embedding to user profile and mark voice_trained = True."""
+    user.voice_embedding = embedding
+    user.voice_trained   = True
+    user.save(update_fields=["voice_embedding", "voice_trained"])
+    logger.info("Saved %d-dim embedding for user %s", len(embedding), user.id)
+
+
+def _notify_success(user):
+    """Push completion event via WebSocket channel + FCM."""
+    # WebSocket push to user's personal channel
+    _push_ws_event(
+        user_id = str(user.id),
+        event   = "voice.training_complete",
+        payload = {
+            "voice_trained": True,
+            "next_step":     "main_chat",
+            "message":       "Your voice profile is ready!",
+        },
+    )
+
+    # FCM push to all user devices
+    try:
+        from apps.friendships.models import UserDevice
+        from services.fcm_service import notify_voice_training_complete
+        tokens = list(UserDevice.objects.filter(user=user).values_list("fcm_token", flat=True))
+        for token in tokens:
+            notify_voice_training_complete(token)
+    except Exception as e:
+        logger.warning("FCM voice training complete push failed: %s", e)
+
+    # Send welcome email if this is the first time
+    try:
+        from services.email_service import send_welcome_email
+        send_welcome_email.delay(user.email, user.name)
+    except Exception as e:
+        logger.warning("Welcome email failed: %s", e)
+
+
+def _notify_failure(user, reason: str):
+    """Notify user of training failure via WebSocket + FCM."""
+    _push_ws_event(
+        user_id = str(user.id),
+        event   = "voice.training_failed",
+        payload = {
+            "voice_trained": False,
+            "error":         "Voice training failed. Please try recording again.",
+            "debug_reason":  reason,
+        },
+    )
+
+    try:
+        from apps.friendships.models import UserDevice
+        from services.fcm_service import send_push
+        tokens = list(UserDevice.objects.filter(user=user).values_list("fcm_token", flat=True))
+        for token in tokens:
+            send_push(
+                device_token      = token,
+                title             = "Voice Training Failed",
+                body              = "There was a problem processing your voice. Please try again.",
+                notification_type = "voice_trained",
+            )
+    except Exception as e:
+        logger.warning("FCM voice training failure push failed: %s", e)
+
+
+def _push_ws_event(user_id: str, event: str, payload: dict):
+    """
+    Send a WebSocket event to a user's personal presence channel.
+    Uses Django Channels' async_to_sync to call channel_layer from sync Celery context.
+    """
+    try:
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            logger.warning("No channel layer configured — skipping WS push")
+            return
+
+        group_name = f"presence_user_{user_id}"
+        async_to_sync(channel_layer.group_send)(
+            group_name,
+            {
+                "type":    "voice.training_update",
+                "payload": {"event": event, **payload},
+            },
+        )
+        logger.info("WS event pushed: %s → user %s", event, user_id)
+    except Exception as e:
+        logger.error("WebSocket push failed: %s", e)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Determine if the exception is likely transient (worth retrying)."""
+    retryable_types = (
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+    return isinstance(exc, retryable_types) or "timeout" in str(exc).lower()
+# ===== d:/yaap1/YAAP\backend\tasks\__init__.py =====
+# ===== d:/yaap1/YAAP\backend\yaap\asgi.py =====
+"""
+YAAP ASGI Configuration
+Routes HTTP → Django, WebSocket → Django Channels consumers
+"""
+
+import os
+
+from channels.auth import AuthMiddlewareStack
+from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.security.websocket import AllowedHostsOriginValidator
+from django.core.asgi import get_asgi_application
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "yaap.settings")
+
+# Initialize Django ASGI application early to ensure the AppRegistry is populated
+django_asgi_app = get_asgi_application()
+
+# Import routing AFTER Django is ready
+from channels_consumers.routing import websocket_urlpatterns  # noqa: E402
+from channels_consumers.middleware import JWTAuthMiddleware   # noqa: E402
+
+application = ProtocolTypeRouter(
+    {
+        "http": django_asgi_app,
+        "websocket": AllowedHostsOriginValidator(
+            JWTAuthMiddleware(
+                URLRouter(websocket_urlpatterns)
+            )
+        ),
+    }
+)
+
+
+
+
+# ===== d:/yaap1/YAAP\backend\yaap\celery.py =====
+"""Celery application configuration for YAAP."""
+
+import os
+from celery import Celery
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "yaap.settings")
+
+app = Celery("yaap")
+
+# Load config from Django settings, namespace=CELERY
+app.config_from_object("django.conf:settings", namespace="CELERY")
+
+# Auto-discover tasks in all installed apps
+app.autodiscover_tasks()
+
+
+@app.task(bind=True, ignore_result=True)
+def debug_task(self):
+    print(f"Request: {self.request!r}")
+# ===== d:/yaap1/YAAP\backend\yaap\exceptions.py =====
+import logging
+from rest_framework.views import exception_handler
+from rest_framework.response import Response
+from rest_framework import status
+
+logger = logging.getLogger(__name__)
+
+
+def custom_exception_handler(exc, context):
+    """
+    Wraps all DRF exceptions in a consistent envelope:
+    {
+        "success": false,
+        "error": {
+            "code": "VALIDATION_ERROR",
+            "message": "Human-readable message",
+            "details": {...}   # optional field-level errors
+        }
+    }
+    """
+    response = exception_handler(exc, context)
+
+    if response is not None:
+        error_payload = {
+            "success": False,
+            "error": {
+                "code": _get_error_code(response.status_code),
+                "message": _get_message(response.data),
+                "details": response.data if isinstance(response.data, dict) else None,
+            },
+        }
+        response.data = error_payload
+
+    else:
+        # Unhandled exception — 500
+        logger.exception("Unhandled exception in view", exc_info=exc)
+        response = Response(
+            {
+                "success": False,
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "An unexpected error occurred. Please try again.",
+                    "details": None,
+                },
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    return response
+
+
+def _get_error_code(status_code: int) -> str:
+    mapping = {
+        400: "VALIDATION_ERROR",
+        401: "AUTHENTICATION_FAILED",
+        403: "PERMISSION_DENIED",
+        404: "NOT_FOUND",
+        405: "METHOD_NOT_ALLOWED",
+        409: "CONFLICT",
+        429: "RATE_LIMIT_EXCEEDED",
+        500: "INTERNAL_ERROR",
+    }
+    return mapping.get(status_code, "ERROR")
+
+
+def _get_message(data) -> str:
+    if isinstance(data, dict):
+        if "detail" in data:
+            return str(data["detail"])
+        # Return first field error
+        for key, value in data.items():
+            if isinstance(value, list) and value:
+                return f"{key}: {value[0]}"
+            if isinstance(value, str):
+                return value
+    if isinstance(data, list) and data:
+        return str(data[0])
+    return "An error occurred."
+# ===== d:/yaap1/YAAP\backend\yaap\health.py =====
+"""
+YAAP Health Check
+Extended in Phase 7 to include XTTS and Whisper microservice status.
+Used by AWS ALB / GCP load balancer and monitoring.
+"""
+from django.http import JsonResponse
+from django.urls import path
+from django.db import connection
+from django.core.cache import cache
+
+
+def health_check(request):
+    health = {"status": "ok", "checks": {}}
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    try:
+        connection.ensure_connection()
+        health["checks"]["database"] = "ok"
+    except Exception as e:
+        health["checks"]["database"] = f"error: {e}"
+        health["status"] = "degraded"
+
+    # ── Redis ─────────────────────────────────────────────────────────────────
+    try:
+        cache.set("health_ping", "pong", timeout=5)
+        assert cache.get("health_ping") == "pong"
+        health["checks"]["redis"] = "ok"
+    except Exception as e:
+        health["checks"]["redis"] = f"error: {e}"
+        health["status"] = "degraded"
+
+    status_code = 200 if health["status"] == "ok" else 503
+    return JsonResponse(health, status=status_code)
+
+
+def deep_health_check(request):
+    """
+    Extended health: also checks XTTS and Whisper microservices.
+    Called by monitoring systems, not load balancer (slower).
+    """
+    health = {"status": "ok", "checks": {}}
+
+    # Database
+    try:
+        connection.ensure_connection()
+        health["checks"]["database"] = "ok"
+    except Exception as e:
+        health["checks"]["database"] = f"error: {e}"
+        health["status"] = "degraded"
+
+    # Redis
+    try:
+        cache.set("health_ping", "pong", timeout=5)
+        assert cache.get("health_ping") == "pong"
+        health["checks"]["redis"] = "ok"
+    except Exception as e:
+        health["checks"]["redis"] = f"error: {e}"
+        health["status"] = "degraded"
+
+    # XTTS microservice
+    try:
+        from services.xtts_client import is_xtts_service_healthy
+        if is_xtts_service_healthy():
+            health["checks"]["xtts_service"] = "ok"
+        else:
+            health["checks"]["xtts_service"] = "unreachable"
+            health["status"] = "degraded"
+    except Exception as e:
+        health["checks"]["xtts_service"] = f"error: {e}"
+        health["status"] = "degraded"
+
+    # Whisper microservice
+    try:
+        from services.whisper_service import is_whisper_service_healthy
+        if is_whisper_service_healthy():
+            health["checks"]["whisper_service"] = "ok"
+        else:
+            health["checks"]["whisper_service"] = "unreachable"
+            health["status"] = "degraded"
+    except Exception as e:
+        health["checks"]["whisper_service"] = f"error: {e}"
+        health["status"] = "degraded"
+
+    status_code = 200 if health["status"] == "ok" else 503
+    return JsonResponse(health, status=status_code)
+
+
+urlpatterns = [
+    path("",       health_check,      name="health-check"),
+    path("deep/",  deep_health_check, name="health-deep"),
+]
+# ===== d:/yaap1/YAAP\backend\yaap\pagination.py =====
+from rest_framework.pagination import CursorPagination, PageNumberPagination
+
+
+class StandardResultsPagination(PageNumberPagination):
+    """Default pagination — used for lists like search results, friends."""
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class MessageCursorPagination(CursorPagination):
+    """
+    Cursor-based pagination for chat messages.
+    Cursor pagination is ideal for infinite scroll because it is stable
+    even when new messages arrive (no page-drift).
+    """
+    page_size = 50
+    ordering = "-created_at"
+    cursor_query_param = "cursor"
+# ===== d:/yaap1/YAAP\backend\yaap\settings.py =====
+"""
+YAAP Backend — Django Settings
+Supports: Dev (DEBUG=True) and Production (DEBUG=False) via environment variables.
+"""
+
+import os
+from datetime import timedelta
+from pathlib import Path
+
+import environ
+import sentry_sdk
+from sentry_sdk.integrations.django import DjangoIntegration
+from sentry_sdk.integrations.celery import CeleryIntegration
+from sentry_sdk.integrations.redis import RedisIntegration
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# ─── Environment ──────────────────────────────────────────────────────────────
+env = environ.Env(
+    DJANGO_DEBUG=(bool, False),
+    DJANGO_ALLOWED_HOSTS=(list, ["localhost", "127.0.0.1"]),
+    JWT_ACCESS_TOKEN_LIFETIME_MINUTES=(int, 15),
+    JWT_REFRESH_TOKEN_LIFETIME_DAYS=(int, 30),
+    OTP_EXPIRY_MINUTES=(int, 10),
+)
+environ.Env.read_env(BASE_DIR / ".env")
+
+# ─── Core ─────────────────────────────────────────────────────────────────────
+SECRET_KEY = env("DJANGO_SECRET_KEY")
+DEBUG = env("DJANGO_DEBUG")
+ALLOWED_HOSTS = ["*"] if DEBUG else env("DJANGO_ALLOWED_HOSTS")
+
+# ─── Applications ─────────────────────────────────────────────────────────────
+DJANGO_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+]
+
+THIRD_PARTY_APPS = [
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
+    "corsheaders",
+    "channels",
+    "django_filters",
+    "django_celery_results",
+    "django_celery_beat",
+    "drf_spectacular",
+    "django_structlog",
+]
+
+LOCAL_APPS = [
+    "apps.accounts",
+    "apps.friendships",
+    "apps.messaging",
+    "apps.calls",
+    "apps.voice",
+]
+
+INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
+
+# ─── Middleware ───────────────────────────────────────────────────────────────
+MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "django_structlog.middlewares.RequestMiddleware",
+]
+
+ROOT_URLCONF = "yaap.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+# ─── ASGI / WSGI ──────────────────────────────────────────────────────────────
+WSGI_APPLICATION = "yaap.wsgi.application"
+ASGI_APPLICATION = "yaap.asgi.application"
+
+# ─── Database (Supabase PostgreSQL) ───────────────────────────────────────────
+DATABASES = {
+    "default": env.db("DATABASE_URL")
+}
+DATABASES["default"]["CONN_MAX_AGE"] = 60            # in cases where connection pooling isn't available, keep connections open for 1 minute to reduce overhead.
+#DATABASES["default"]["CONN_MAX_AGE"] = 0            # disable persistent connections (use with connection pooling like PgBouncer or Supabase Pooling)
+
+DATABASES["default"]["OPTIONS"] = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,

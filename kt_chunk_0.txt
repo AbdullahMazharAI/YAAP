@@ -1,0 +1,800 @@
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\YaapApplication.kt =====
+package com.yaap.app
+
+import android.app.Application
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.os.Build
+import com.yaap.app.utils.Constants
+import dagger.hilt.android.HiltAndroidApp
+import org.webrtc.PeerConnectionFactory
+
+@HiltAndroidApp
+class YaapApplication : Application() {
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannels()
+        initWebRTC()
+    }
+
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+
+            val channels = listOf(
+                NotificationChannel(
+                    Constants.CHANNEL_MESSAGES,
+                    "Messages",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Chat message notifications"
+                    enableVibration(true)
+                },
+                NotificationChannel(
+                    Constants.CHANNEL_CALLS,
+                    "Calls",
+                    NotificationManager.IMPORTANCE_MAX
+                ).apply {
+                    description = "Incoming call notifications"
+                    enableVibration(true)
+                },
+                NotificationChannel(
+                    Constants.CHANNEL_SOCIAL,
+                    "Friend Requests",
+                    NotificationManager.IMPORTANCE_DEFAULT
+                ).apply {
+                    description = "Friend request notifications"
+                },
+                NotificationChannel(
+                    Constants.CHANNEL_SYSTEM,
+                    "System",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Voice training and system notifications"
+                }
+            )
+
+            channels.forEach { manager.createNotificationChannel(it) }
+        }
+    }
+
+    private fun initWebRTC() {
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(this)
+                .setEnableInternalTracer(false)
+                .createInitializationOptions()
+        )
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\api\AuthInterceptor.kt =====
+package com.yaap.app.data.api
+import com.google.gson.Gson
+import com.yaap.app.model.ApiEnvelope
+import com.yaap.app.model.RefreshTokenRequest
+import com.yaap.app.model.TokenRefreshDataResponse
+import com.yaap.app.utils.TokenManager
+import dagger.Lazy
+import kotlinx.coroutines.runBlocking
+import okhttp3.Authenticator
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.Route
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Attaches the Bearer token to every outgoing request.
+ */
+@Singleton
+class AuthInterceptor @Inject constructor(
+    private val tokenManager: TokenManager
+) : Interceptor {
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val token = tokenManager.getAccessToken()
+        val request = if (token != null) {
+            chain.request().newBuilder()
+                .addHeader("Authorization", "Bearer $token")
+                .build()
+        } else {
+            chain.request()
+        }
+        return chain.proceed(request)
+    }
+}
+
+/**
+ * On 401: attempts a token refresh and retries the original request.
+ * Uses Lazy<YaapApiService> to break the Hilt circular dependency:
+ *   YaapApiService → TokenAuthenticator → OkHttpClient → Retrofit → YaapApiService
+ * Lazy defers the YaapApiService lookup until first actual 401, after the
+ * entire object graph has been constructed.
+ *
+ * Key fix: Backend's SimpleJWT expects {"refresh": "..."} and returns
+ * {"success": true, "data": {"tokens": {"access": "...", "refresh": "..."}}}
+ */
+@Singleton
+class TokenAuthenticator @Inject constructor(
+    private val tokenManager: TokenManager,
+    private val lazyApiService: Lazy<YaapApiService>   // ← Lazy breaks the cycle
+) : Authenticator {
+
+    override fun authenticate(route: Route?, response: Response): Request? {
+        // Prevent infinite retry loops
+        if (response.request.header("X-Retry-After-Refresh") != null) {
+            tokenManager.clearTokens()
+            return null
+        }
+
+        val refreshToken = tokenManager.getRefreshToken() ?: run {
+            tokenManager.clearTokens()
+            return null
+        }
+
+        return runBlocking {
+            try {
+                // Send {"refresh": "..."} — matches SimpleJWT's expected field name
+                val refreshResponse = lazyApiService.get()
+                    .refreshToken(RefreshTokenRequest(refreshToken))
+
+                if (refreshResponse.isSuccessful) {
+                    val envelope = refreshResponse.body()
+                    if (envelope != null && envelope.success && envelope.data != null) {
+                        val tokens = envelope.data.tokens
+                        tokenManager.saveTokens(tokens.access, tokens.refresh)
+                        response.request.newBuilder()
+                            .header("Authorization", "Bearer ${tokens.access}")
+                            .header("X-Retry-After-Refresh", "true")
+                            .build()
+                    } else {
+                        tokenManager.clearTokens()
+                        null
+                    }
+                } else {
+                    tokenManager.clearTokens()
+                    null
+                }
+            } catch (e: Exception) {
+                tokenManager.clearTokens()
+                null
+            }
+        }
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\api\WebSocketManager.kt =====
+package com.yaap.app.data.api
+
+import com.yaap.app.utils.Constants
+import com.yaap.app.utils.TokenManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class WebSocketManager @Inject constructor(
+    private val okHttpClient: OkHttpClient,
+    private val tokenManager: TokenManager
+) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private var presenceWebSocket: WebSocket? = null
+    private var reconnectAttempt = 0
+    private var pingJob: Job? = null
+    private var isConnected = false
+
+    private val _presenceEvents = MutableSharedFlow<JSONObject>(replay = 0, extraBufferCapacity = 64)
+    val presenceEvents: SharedFlow<JSONObject> = _presenceEvents
+
+    fun connect() {
+        if (isConnected) return
+        val token = tokenManager.getAccessToken() ?: return
+
+        val url = "${Constants.WS_BASE_URL}/ws/presence/?token=$token"
+        val request = Request.Builder().url(url).build()
+
+        presenceWebSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                isConnected = true
+                reconnectAttempt = 0
+                startPingJob()
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val json = JSONObject(text)
+                    scope.launch { _presenceEvents.emit(json) }
+                } catch (e: Exception) { /* ignore malformed */ }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                isConnected = false
+                stopPingJob()
+                scheduleReconnect()
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isConnected = false
+                stopPingJob()
+            }
+        })
+    }
+
+    fun disconnect() {
+        isConnected = false
+        stopPingJob()
+        presenceWebSocket?.close(1000, "User logout")
+        presenceWebSocket = null
+        reconnectAttempt = 0
+    }
+
+    private fun startPingJob() {
+        pingJob = scope.launch {
+            while (isConnected) {
+                delay(Constants.WS_PING_INTERVAL_MS)
+                presenceWebSocket?.send("""{"type":"ping"}""")
+            }
+        }
+    }
+
+    private fun stopPingJob() {
+        pingJob?.cancel()
+        pingJob = null
+    }
+
+    private fun scheduleReconnect() {
+        val delays = Constants.WS_BACKOFF_DELAYS
+        val delayMs = delays.getOrElse(reconnectAttempt) { delays.last() }
+        reconnectAttempt++
+        scope.launch {
+            delay(delayMs)
+            if (!isConnected) connect()
+        }
+    }
+}
+
+/**
+ * Per-conversation chat WebSocket. Created fresh for each ChatActivity.
+ */
+class ChatWebSocket(
+    private val okHttpClient: OkHttpClient,
+    private val conversationId: String,
+    private val token: String
+) {
+    private var webSocket: WebSocket? = null
+    private var isConnected = false
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var reconnectAttempt = 0
+
+    private val _messages = MutableSharedFlow<JSONObject>(replay = 0, extraBufferCapacity = 128)
+    val messages: SharedFlow<JSONObject> = _messages
+
+    fun connect() {
+        val url = "${Constants.WS_BASE_URL}/ws/chat/$conversationId/?token=$token"
+        val request = Request.Builder().url(url).build()
+        webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                isConnected = true
+                reconnectAttempt = 0
+                // Load initial history
+                send("""{"type":"load_history","payload":{"page_size":50}}""")
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val json = JSONObject(text)
+                    scope.launch { _messages.emit(json) }
+                } catch (_: Exception) {}
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                isConnected = false
+                scheduleReconnect()
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isConnected = false
+            }
+        })
+    }
+
+    fun send(payload: String) = webSocket?.send(payload)
+
+    fun sendMessage(content: String) {
+        val payload = JSONObject().put("content", content)
+        send(JSONObject().put("type", "send_message").put("payload", payload).toString())
+    }
+
+    fun sendTypingStart() = send(JSONObject().put("type", "typing_start").put("payload", JSONObject()).toString())
+    
+    fun sendTypingStop() = send(JSONObject().put("type", "typing_stop").put("payload", JSONObject()).toString())
+    
+    fun sendMarkRead(messageId: String) {
+        val payload = JSONObject().put("message_id", messageId)
+        send(JSONObject().put("type", "mark_read").put("payload", payload).toString())
+    }
+    
+    fun sendDeleteMessage(messageId: String, scope: String = "everyone") {
+        val payload = JSONObject().put("message_id", messageId).put("scope", scope)
+        send(JSONObject().put("type", "delete_message").put("payload", payload).toString())
+    }
+
+    fun loadHistory(cursor: String) {
+        val payload = JSONObject().put("cursor", cursor).put("page_size", 50)
+        send(JSONObject().put("type", "load_history").put("payload", payload).toString())
+    }
+
+    fun disconnect() {
+        isConnected = false
+        webSocket?.close(1000, "Activity destroyed")
+        webSocket = null
+    }
+
+    private fun scheduleReconnect() {
+        val delays = Constants.WS_BACKOFF_DELAYS
+        val delayMs = delays.getOrElse(reconnectAttempt) { delays.last() }
+        reconnectAttempt++
+        scope.launch {
+            delay(delayMs)
+            if (!isConnected) connect()
+        }
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\api\YaapApiService.kt =====
+package com.yaap.app.data.api
+
+import com.yaap.app.model.*
+import okhttp3.MultipartBody
+import retrofit2.Response
+import retrofit2.http.*
+
+interface YaapApiService {
+
+    // ---- Auth ----
+
+    @POST("/api/v1/auth/login/")
+    suspend fun login(@Body request: LoginRequest): Response<ApiEnvelope<AuthDataResponse>>
+
+    @POST("/api/v1/auth/signup/")
+    suspend fun signup(@Body request: SignupRequest): Response<ApiEnvelope<AuthDataResponse>>
+
+    @POST("/api/v1/auth/otp/request/")
+    suspend fun requestOtp(@Body request: OtpRequestBody): Response<ApiEnvelope<MessageResponse>>
+
+    @POST("/api/v1/auth/otp/verify/")
+    suspend fun verifyOtp(@Body request: OtpVerifyRequest): Response<ApiEnvelope<AuthDataResponse>>
+
+    @POST("/api/v1/auth/google/")
+    suspend fun googleAuth(@Body request: GoogleAuthRequest): Response<ApiEnvelope<AuthDataResponse>>
+
+    @POST("/api/v1/auth/token/refresh/")
+    suspend fun refreshToken(@Body request: RefreshTokenRequest): Response<ApiEnvelope<TokenRefreshDataResponse>>
+
+    @POST("/api/v1/auth/logout/")
+    suspend fun logout(): Response<ApiEnvelope<MessageResponse>>
+
+    @POST("/api/v1/auth/password/strength/")
+    suspend fun checkPasswordStrength(@Body request: PasswordStrengthRequest): Response<ApiEnvelope<PasswordStrengthResponse>>
+
+    @POST("/api/v1/auth/password/reset/")
+    suspend fun resetPassword(@Body request: OtpRequestBody): Response<ApiEnvelope<MessageResponse>>
+
+    // ---- User ----
+
+    @GET("/api/v1/users/me/")
+    suspend fun getMyProfile(): Response<ApiEnvelope<User>>
+
+    @PATCH("/api/v1/users/me/")
+    suspend fun updateProfile(@Body request: UpdateProfileRequest): Response<ApiEnvelope<User>>
+
+    @Multipart
+    @POST("/api/v1/users/me/avatar/")
+    suspend fun uploadAvatar(@Part avatar: MultipartBody.Part): Response<ApiEnvelope<Map<String, String>>>
+
+    @PATCH("/api/v1/users/me/language/")
+    suspend fun updateLanguage(@Body request: LanguageUpdateRequest): Response<ApiEnvelope<Map<String, String>>>
+
+    @GET("/api/v1/users/languages/")
+    suspend fun getLanguages(): Response<ApiEnvelope<LanguagesDataResponse>>
+
+    @GET("/api/v1/users/search/")
+    suspend fun searchUsers(@Query("q") query: String): Response<ApiEnvelope<UserSearchDataResponse>>
+
+    @GET("/api/v1/users/{id}/")
+    suspend fun getUserProfile(@Path("id") userId: String): Response<ApiEnvelope<User>>
+
+    // ---- Voice ----
+
+    @GET("/api/v1/voice/sentences/")
+    suspend fun getVoiceSentences(): Response<ApiEnvelope<VoiceSentencesDataResponse>>
+
+    @Multipart
+    @POST("/api/v1/voice/samples/")
+    suspend fun uploadVoiceSample(
+        @Part audio: MultipartBody.Part,
+        @Part("sample_index") sampleIndex: Int,
+        @Part("sentence_id") sentenceId: String
+    ): Response<ApiEnvelope<VoiceSampleDataResponse>>
+
+    @DELETE("/api/v1/voice/samples/{index}/")
+    suspend fun deleteVoiceSample(@Path("index") index: Int): Response<ApiEnvelope<MessageResponse>>
+
+    @POST("/api/v1/voice/train/")
+    suspend fun trainVoice(): Response<ApiEnvelope<VoiceTrainDataResponse>>
+
+    @GET("/api/v1/voice/status/")
+    suspend fun getVoiceStatus(): Response<ApiEnvelope<VoiceStatusDataResponse>>
+
+    @POST("/api/v1/voice/reset/")
+    suspend fun resetVoice(): Response<ApiEnvelope<MessageResponse>>
+
+    // ---- Friends ----
+
+    @POST("/api/v1/friends/devices/")
+    suspend fun registerDevice(@Body request: RegisterDeviceRequest): Response<ApiEnvelope<MessageResponse>>
+
+    @GET("/api/v1/friends/")
+    suspend fun getFriends(): Response<ApiEnvelope<FriendsDataResponse>>
+
+    @DELETE("/api/v1/friends/{friendshipId}/")
+    suspend fun unfriend(@Path("friendshipId") friendshipId: String): Response<ApiEnvelope<MessageResponse>>
+
+    @POST("/api/v1/friends/request/")
+    suspend fun sendFriendRequest(@Body request: SendFriendRequest): Response<ApiEnvelope<FriendRequestSendDataResponse>>
+
+    @GET("/api/v1/friends/requests/received/")
+    suspend fun getReceivedRequests(): Response<ApiEnvelope<FriendRequestsDataResponse>>
+
+    @GET("/api/v1/friends/requests/sent/")
+    suspend fun getSentRequests(): Response<ApiEnvelope<FriendRequestsDataResponse>>
+
+    @POST("/api/v1/friends/requests/{id}/accept/")
+    suspend fun acceptFriendRequest(@Path("id") requestId: String): Response<ApiEnvelope<AcceptRequestDataResponse>>
+
+    @POST("/api/v1/friends/requests/{id}/decline/")
+    suspend fun declineFriendRequest(@Path("id") requestId: String): Response<ApiEnvelope<MessageResponse>>
+
+    @DELETE("/api/v1/friends/requests/{id}/")
+    suspend fun cancelFriendRequest(@Path("id") requestId: String): Response<ApiEnvelope<MessageResponse>>
+
+    @POST("/api/v1/friends/block/")
+    suspend fun blockUser(@Body request: BlockRequest): Response<ApiEnvelope<MessageResponse>>
+
+    @DELETE("/api/v1/friends/block/{userId}/")
+    suspend fun unblockUser(@Path("userId") userId: String): Response<ApiEnvelope<MessageResponse>>
+
+    @GET("/api/v1/friends/blocked/")
+    suspend fun getBlockedUsers(): Response<ApiEnvelope<Map<String, Any>>>
+
+    // ---- Conversations ----
+
+    @GET("/api/v1/conversations/")
+    suspend fun getConversations(): Response<ApiEnvelope<ConversationsDataResponse>>
+
+    @POST("/api/v1/conversations/start/")
+    suspend fun startConversation(@Body request: StartConversationRequest): Response<ApiEnvelope<ConversationDataResponse>>
+
+    @GET("/api/v1/conversations/{id}/messages/")
+    suspend fun getMessages(
+        @Path("id") conversationId: String,
+        @Query("cursor") cursor: String? = null,
+        @Query("page_size") pageSize: Int = 50
+    ): Response<ApiEnvelope<MessagesPage>>
+
+    @POST("/api/v1/conversations/{id}/messages/")
+    suspend fun sendMessageRest(
+        @Path("id") conversationId: String,
+        @Body body: Map<String, String>
+    ): Response<ApiEnvelope<Message>>
+
+    @POST("/api/v1/conversations/messages/{id}/translate/")
+    suspend fun translateMessage(
+        @Path("id") messageId: String,
+        @Body request: TranslateMessageRequest
+    ): Response<ApiEnvelope<TranslateMessageDataResponse>>
+
+    @DELETE("/api/v1/conversations/messages/{id}/")
+    suspend fun deleteMessage(@Path("id") messageId: String): Response<ApiEnvelope<MessageResponse>>
+
+    // ---- Calls ----
+
+    @POST("/api/v1/calls/initiate/")
+    suspend fun initiateCall(@Body request: InitiateCallRequest): Response<ApiEnvelope<InitiateCallDataResponse>>
+
+    @GET("/api/v1/calls/ice-config/{roomId}/")
+    suspend fun getIceConfig(@Path("roomId") roomId: String): Response<ApiEnvelope<IceConfigDataResponse>>
+
+    @POST("/api/v1/calls/{roomId}/end/")
+    suspend fun endCall(@Path("roomId") roomId: String): Response<ApiEnvelope<MessageResponse>>
+
+    @POST("/api/v1/calls/{roomId}/decline/")
+    suspend fun declineCall(@Path("roomId") roomId: String): Response<ApiEnvelope<MessageResponse>>
+
+    @GET("/api/v1/calls/history/")
+    suspend fun getCallHistory(): Response<ApiEnvelope<CallHistoryDataResponse>>
+
+    @GET("/api/v1/calls/active/")
+    suspend fun getActiveCall(): Response<ApiEnvelope<ActiveCallDataResponse>>
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\local\YaapDatabase.kt =====
+package com.yaap.app.data.local
+
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import android.content.Context
+import com.yaap.app.data.local.dao.*
+import com.yaap.app.data.local.entity.*
+
+@Database(
+    entities = [
+        ConversationEntity::class,
+        MessageEntity::class,
+        UserEntity::class,
+        FriendRequestEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+abstract class YaapDatabase : RoomDatabase() {
+    abstract fun conversationDao(): ConversationDao
+    abstract fun messageDao(): MessageDao
+    abstract fun userDao(): UserDao
+    abstract fun friendRequestDao(): FriendRequestDao
+
+    companion object {
+        fun create(context: Context): YaapDatabase =
+            Room.databaseBuilder(context, YaapDatabase::class.java, "yaap.db")
+                .fallbackToDestructiveMigration()
+                .build()
+    }
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\local\dao\Daos.kt =====
+package com.yaap.app.data.local.dao
+
+import androidx.room.*
+import com.yaap.app.data.local.entity.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface ConversationDao {
+    @Query("SELECT * FROM conversations ORDER BY updatedAt DESC")
+    fun observeAll(): Flow<List<ConversationEntity>>
+
+    @Query("SELECT * FROM conversations ORDER BY updatedAt DESC")
+    suspend fun getAll(): List<ConversationEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(conversations: List<ConversationEntity>)
+
+    @Query("DELETE FROM conversations WHERE id = :id")
+    suspend fun delete(id: String)
+
+    @Query("UPDATE conversations SET unreadCount = 0 WHERE id = :id")
+    suspend fun markRead(id: String)
+}
+
+@Dao
+interface MessageDao {
+    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt DESC LIMIT 50")
+    fun observeMessages(conversationId: String): Flow<List<MessageEntity>>
+
+    @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt DESC LIMIT :limit OFFSET :offset")
+    suspend fun getMessages(conversationId: String, limit: Int = 50, offset: Int = 0): List<MessageEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(messages: List<MessageEntity>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(message: MessageEntity)
+
+    @Query("UPDATE messages SET status = :status WHERE id = :id")
+    suspend fun updateStatus(id: String, status: String)
+
+    @Query("UPDATE messages SET translation = :translation WHERE id = :id")
+    suspend fun updateTranslation(id: String, translation: String)
+
+    @Query("UPDATE messages SET deleted = 1, content = 'This message was deleted.' WHERE id = :id")
+    suspend fun markDeleted(id: String)
+}
+
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM users WHERE id = :id")
+    suspend fun getById(id: String): UserEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(user: UserEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(users: List<UserEntity>)
+
+    @Query("UPDATE users SET isOnline = :online WHERE id = :id")
+    suspend fun updateOnlineStatus(id: String, online: Boolean)
+}
+
+@Dao
+interface FriendRequestDao {
+    @Query("SELECT * FROM friend_requests WHERE status = 'pending' ORDER BY createdAt DESC")
+    fun observePendingReceived(): Flow<List<FriendRequestEntity>>
+
+    @Query("SELECT COUNT(*) FROM friend_requests WHERE status = 'pending'")
+    fun observePendingCount(): Flow<Int>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(requests: List<FriendRequestEntity>)
+
+    @Query("DELETE FROM friend_requests WHERE id = :id")
+    suspend fun delete(id: String)
+}
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\local\entity\Entities.kt =====
+package com.yaap.app.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.ForeignKey
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "conversations")
+data class ConversationEntity(
+    @PrimaryKey val id: String,
+    val otherUserId: String,
+    val otherUserName: String,
+    val otherUserAvatar: String?,
+    val otherUserCountryCode: String?,
+    val otherUserTimezone: String?,
+    val otherUserOnline: Boolean = false,
+    val lastMessageContent: String?,
+    val lastMessageTranslation: String?,
+    val lastMessageTimestamp: String?,
+    val unreadCount: Int = 0,
+    val updatedAt: String
+)
+
+@Entity(tableName = "messages", indices = [Index("conversationId")])
+data class MessageEntity(
+    @PrimaryKey val id: String,
+    val conversationId: String,
+    val senderId: String,
+    val content: String,
+    val translation: String?,
+    val status: String,
+    val createdAt: String,
+    val deleted: Boolean = false
+)
+
+@Entity(tableName = "users")
+data class UserEntity(
+    @PrimaryKey val id: String,
+    val displayName: String,
+    val email: String,
+    val avatarUrl: String?,
+    val countryCode: String?,
+    val timezone: String?,
+    val bio: String?,
+    val isOnline: Boolean = false,
+    val languagePreference: String?,
+    val voiceTrained: Boolean = false
+)
+
+@Entity(tableName = "friend_requests", indices = [Index("fromUserId")])
+data class FriendRequestEntity(
+    @PrimaryKey val id: String,
+    val fromUserId: String,
+    val fromUserName: String,
+    val fromUserAvatar: String?,
+    val toUserId: String,
+    val status: String,
+    val message: String?,
+    val createdAt: String
+)
+// ===== d:/yaap1/YAAP\frontend\app\src\main\java\com\yaap\app\data\repository\AuthRepository.kt =====
+package com.yaap.app.data.repository
+
+import com.yaap.app.data.api.YaapApiService
+import com.yaap.app.model.*
+import com.yaap.app.utils.Result
+import com.yaap.app.utils.TokenManager
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class AuthRepository @Inject constructor(
+    private val api: YaapApiService,
+    private val tokenManager: TokenManager
+) {
+    /**
+     * Login → unwrap envelope → extract tokens → return AuthResponse for UI.
+     */
+    suspend fun login(email: String, password: String): Result<AuthResponse> {
+        val result = safeApiCall { api.login(LoginRequest(email, password)) }
+        return when (result) {
+            is Result.Success -> {
+                val data = result.data
+                tokenManager.saveTokens(data.tokens.access, data.tokens.refresh)
+                Result.Success(AuthResponse.from(data))
+            }
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    /**
+     * Signup → sends password_confirm = password (backend requires it).
+     */
+    suspend fun signup(email: String, password: String, fullName: String): Result<AuthResponse> {
+        val result = safeApiCall {
+            api.signup(SignupRequest(email, password, fullName, passwordConfirm = password))
+        }
+        return when (result) {
+            is Result.Success -> {
+                val data = result.data
+                tokenManager.saveTokens(data.tokens.access, data.tokens.refresh)
+                Result.Success(AuthResponse.from(data))
+            }
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun requestOtp(email: String): Result<MessageResponse> = safeApiCall {
+        api.requestOtp(OtpRequestBody(email))
+    }
+
+    suspend fun verifyOtp(email: String, otp: String): Result<AuthResponse> {
+        val result = safeApiCall { api.verifyOtp(OtpVerifyRequest(email, otp)) }
+        return when (result) {
+            is Result.Success -> {
+                val data = result.data
+                tokenManager.saveTokens(data.tokens.access, data.tokens.refresh)
+                Result.Success(AuthResponse.from(data))
+            }
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun googleAuth(idToken: String): Result<AuthResponse> {
+        val result = safeApiCall { api.googleAuth(GoogleAuthRequest(idToken)) }
+        return when (result) {
+            is Result.Success -> {
+                val data = result.data
+                tokenManager.saveTokens(data.tokens.access, data.tokens.refresh)
+                Result.Success(AuthResponse.from(data))
+            }
+            is Result.Error -> Result.Error(result.message, result.code)
+            is Result.Loading -> Result.Loading
+            is Result.Idle -> Result.Idle
+        }
+    }
+
+    suspend fun logout(): Result<MessageResponse> = safeApiCall { api.logout() }
+
+    suspend fun checkPasswordStrength(password: String): Result<PasswordStrengthResponse> = safeApiCall {
+        api.checkPasswordStrength(PasswordStrengthRequest(password))
+    }
+
+    suspend fun resetPassword(email: String): Result<MessageResponse> = safeApiCall {
+        api.resetPassword(OtpRequestBody(email))
+    }
+
+    fun saveTokens(accessToken: String, refreshToken: String) =
