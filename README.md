@@ -1,127 +1,147 @@
-# YAAP -- Real-Time Communication App
+﻿# YAAP — Developer Setup (Minimal)
 
-YAAP is a real-time communication app with a **Django backend** and a
-**Kotlin Android frontend**, focused on messaging, voice calling, and
-AI-powered language features.
+> Get the backend running in ~10 minutes. Read all the way through once before starting.
 
-------------------------------------------------------------------------
+---
 
-# 📁 Repository Structure
+## Before You Start — File Sharing Rules
 
-    Yaap/
-    ├── backend/   → Django backend
-    └── frontend/  → Kotlin Android app
+| What to share | How |
+|---|---|
+| **Source code** | Private GitHub repo (never commit `.env`) |
+| **Supabase credentials** | Share via a **password manager** link (not Gmail/chat) |
+| **Firebase credentials** | Share `firebase-credentials.json` via encrypted channel only |
+| **`.env` file** | Never commit. Share via private message only. |
 
-------------------------------------------------------------------------
+---
 
-# ⚙️ Backend Setup & Run Guide
+## 1. Prerequisites
 
-## 1️⃣ Go to backend folder
+| Tool | Version | Notes |
+|---|---|---|
+| **Python** | 3.11+ | Backend |
+| **Java JDK** | 17 | Android build |
+| **Android Studio** | Hedgehog 2023.1+ | Frontend |
+| **Docker Desktop** | 24+ | All backend services |
+| **ADB** | any | Comes with Android Studio |
+| **RAM** | 8 GB min | 16 GB recommended |
+| **GPU** | Optional | Only needed for XTTS / Whisper (voice calls) |
 
-    cd backend
+---
 
-------------------------------------------------------------------------
+## 2. Credentials You Need (from project owner)
 
-## 2️⃣ Create & Activate Virtual Environment
+- [ ] Filled `.env` file → place in `backend/`
+- [ ] `firebase-credentials.json` → place in `backend/`
+- [ ] Supabase project URL + keys (already inside `.env`)
+- [ ] DeepL API key (already inside `.env`) — required for chat translation
 
-### Windows PowerShell
+---
 
-    python -m venv .venv
-    .venv\Scripts\Activate.ps1
+## 3. Backend Setup (One Command)
 
-### Windows CMD
+```bash
+cd backend
 
-    python -m venv .venv
-    .venv\Scripts\activate.bat
+# First time: copy and fill env file
+copy .env.example .env
 
-------------------------------------------------------------------------
+# Start core services (Django + Redis + Celery + Nginx)
+docker compose up --build -d web celery_worker celery_beat redis nginx
 
-## 3️⃣ Install Dependencies
-
-    pip install -r requirements.txt
-
-------------------------------------------------------------------------
-
-## 4️⃣ Start Redis (Docker Required)
-
-Make sure **Docker Desktop is running**.
-
-Run Redis container:
-
-    docker run -d --name yaap_redis -p 6379:6379 redis:7-alpine
-
-If container already exists:
-
-    docker start yaap_redis
-
-------------------------------------------------------------------------
-
-## 5️⃣ Run Database Migrations
-
-    python manage.py migrate
-
-------------------------------------------------------------------------
-
-## 6️⃣ Start Celery Worker
-
-Open a **new terminal** in backend folder:
-
-    celery -A yaap worker --loglevel=info --queues=default,email,voice_training,translation
-
-------------------------------------------------------------------------
-
-## 7️⃣ Start Daphne Server (ASGI)
-
-Open another terminal:
-
-    daphne -b 0.0.0.0 -p 8000 yaap.asgi:application
-
-------------------------------------------------------------------------
-
-## 8️⃣ Start Django Development Server
-
-Open another terminal:
-
-    python manage.py runserver
-
-------------------------------------------------------------------------
-
-# ▶️ Running Summary
-
-You typically need **these services running simultaneously**:
-
-  -------------------------------------------------------------------------------------------------------------------------------
-  Service                             Command
-  ----------------------------------- -------------------------------------------------------------------------------------------
-  Redis                               `docker run -d --name yaap_redis -p 6379:6379 redis:7-alpine`
-
-  Celery                              `celery -A yaap worker --loglevel=info --queues=default,email,voice_training,translation`
-
-  Daphne                              `daphne -b 0.0.0.0 -p 8000 yaap.asgi:application`
-
-  Django                              `python manage.py runserver`
-  -------------------------------------------------------------------------------------------------------------------------------
-
-------------------------------------------------------------------------
-
-# 🗄️ Supabase Session Pooling Fix
-
-If you encounter **Supabase session pooling errors**, update:
-
-    Yaap/backend/yaap/settings.py
-
-### Change this:
-
-``` python
-# DATABASES["default"]["CONN_MAX_AGE"] = 60
-DATABASES["default"]["CONN_MAX_AGE"] = 0
+# First time only: run migrations
+docker compose exec web python manage.py migrate
 ```
 
-This disables persistent DB connections and works correctly with
-connection pooling.
+Backend URL: http://localhost:8080
 
-------------------------------------------------------------------------
+---
 
-# ✅ Backend is Ready
+## 4. Services — What Is Mandatory?
 
-Your backend should now be running successfully 🚀
+| Service | Mandatory | Notes |
+|---|---|---|
+| Redis | YES | Channel layer + Celery broker |
+| Django (web) | YES | Daphne ASGI on port 8000 |
+| Celery Worker | YES | Runs translation & notification tasks |
+| Celery Beat | YES | Scheduled cleanup tasks |
+| Nginx | YES | Reverse proxy on port 8080 |
+| Supabase (PostgreSQL) | YES | Cloud — no local setup needed |
+| XTTS | NO | Voice cloning — needs GPU |
+| Whisper | NO | Speech-to-text — needs GPU |
+| Coturn | NO | WebRTC TURN relay — only for calls over mobile data |
+
+**Chat testing only? Skip XTTS, Whisper, Coturn.**
+
+---
+
+## 5. Minimal .env Values for Chat
+
+Copy `backend/.env.example` → `backend/.env` and fill these:
+
+```env
+DJANGO_SECRET_KEY=<any 50+ char random string>
+DJANGO_DEBUG=True
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=<anon key>
+SUPABASE_SERVICE_ROLE_KEY=<service role key>
+DATABASE_URL=postgresql://postgres:<pass>@db.<project>.supabase.co:5432/postgres
+
+DEEPL_API_KEY=<deepl api key>
+
+GOOGLE_CLIENT_ID=<client id>
+GOOGLE_CLIENT_SECRET=<client secret>
+
+FIREBASE_CREDENTIALS_PATH=/app/firebase-credentials.json
+```
+
+Redis/Celery URLs are set automatically by docker-compose — leave them blank in .env.
+
+---
+
+## 6. Android Setup
+
+```bash
+# 1. Open frontend/ in Android Studio
+# 2. Connect phone via USB
+# 3. Run ADB reverse (every time you reconnect the phone):
+adb reverse tcp:8080 tcp:8080
+
+# 4. Build & run from Android Studio
+```
+
+### Two Devices at the Same Time
+
+```powershell
+adb devices                               # get serial numbers
+adb -s <SERIAL1> reverse tcp:8080 tcp:8080
+adb -s <SERIAL2> reverse tcp:8080 tcp:8080
+```
+
+---
+
+## 7. Database Schema
+
+Run `backend/supabase_schema.sql` once in the Supabase SQL editor to create all tables.
+
+---
+
+## 8. Useful Docker Commands
+
+```bash
+docker compose logs -f web               # Django logs
+docker compose logs -f celery_worker     # Translation/task logs
+docker compose restart celery_worker     # Restart one service
+docker compose down                      # Stop everything
+docker compose down -v                   # Full reset (clears Redis)
+```
+
+---
+
+## What You Do NOT Need to Set Up
+
+- Local PostgreSQL — Supabase handles it
+- XTTS / Whisper — only for voice calling feature
+- Coturn — only for calls over mobile data
+- Sentry — leave SENTRY_DSN blank for local dev
